@@ -160,6 +160,9 @@ pip install git+https://github.com/marcusaguiarmaciel-cmd/cato.git
   ```
 *(CATO automatically performs a non-destructive merge into `.claude/settings.json`, preserving existing user settings, models, and statuslines while creating an automated backup)*.
 
+> [!IMPORTANT]
+> **Run `cato init` on every machine, including after cloning this repository.** The hooks in `.claude/settings.json` and the MCP server in `.mcp.json` point to the absolute paths of *your* Python interpreter and CATO install, so these files are generated per machine and are intentionally **not committed** (they are listed in `.gitignore`). A fresh clone has no CATO hooks until you run `cato init`.
+
 ### 3. Run Diagnostic Check
 ```bash
 cato doctor

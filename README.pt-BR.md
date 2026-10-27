@@ -146,6 +146,9 @@ pip install git+https://github.com/marcusaguiarmaciel-cmd/cato.git
   cato init
   ```
 
+> [!IMPORTANT]
+> **Rode `cato init` em cada máquina, inclusive depois de clonar este repositório.** Os hooks em `.claude/settings.json` e o servidor MCP em `.mcp.json` apontam para os caminhos absolutos do *seu* Python e da *sua* instalação do CATO, por isso esses arquivos são gerados por máquina e, de propósito, **não são commitados** (estão no `.gitignore`). Um clone novo não tem os hooks do CATO até você rodar `cato init`.
+
 ### Passo 3: Auditar o ambiente
 ```bash
 cato doctor
