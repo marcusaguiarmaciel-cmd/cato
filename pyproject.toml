@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cato-claude"
-version = "0.1.0"
+version = "0.2.0"
 description = "⚡ CATO (Claude Adaptive Token Optimizer) - Zero-dependency, cache-preserving token optimization toolkit for Claude Code CLI and Desktop"
 readme = "README.md"
 requires-python = ">=3.10"

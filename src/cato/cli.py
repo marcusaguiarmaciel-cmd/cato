@@ -4,6 +4,7 @@ Subcomandos completos (Partes 1 a 6):
   - `cato init [--global | --project] [--dry-run]`
   - `cato doctor`
   - `cato stats [--clear-reads]`
+  - `cato report [--days N] [--project P] [--json]`
   - `cato dashboard [--port 8765] [--no-browser] [--export-only]`
   - `cato statusline`
   - `cato skeleton <arquivo>`
@@ -12,7 +13,7 @@ Subcomandos completos (Partes 1 a 6):
   - `cato search-sandbox <id> <query>`
   - `cato exec [--session-id ID] [--b64 CMD_B64 | <cmd...>]`
   - `cato mcp-server`
-  - `cato hook <pre-tool-use | post-tool-use | pre-compact | session-reset>`
+  - `cato hook <pre-tool-use | post-tool-use | user-prompt-submit | pre-compact | session-reset>`
 """
 
 from __future__ import annotations
@@ -36,14 +37,17 @@ from cato.config_manager import audit_environment, install_cato
 from cato.hooks.post_tool_use import main_stdio as post_tool_use_stdio
 from cato.hooks.pre_tool_use import main_stdio as pre_tool_use_stdio
 from cato.hooks.session_lifecycle import main_stdio as session_lifecycle_stdio
+from cato.hooks.user_prompt_submit import main_stdio as user_prompt_submit_stdio
 from cato.mcp_server.server import execute_mcp_tool, run_mcp_stdio_server
 from cato.storage.db import CatoDB, estimate_tokens
 from cato.telemetry.dashboard import (
-    collect_full_dashboard_payload,
+    collect_real_metrics,
+    format_stats_text,
     format_statusline_text,
     run_dashboard_server,
     write_static_dashboard_html,
 )
+from cato.telemetry.usage_report import build_report, format_report_text, recommendations_from_report
 
 
 def _configure_utf8_stdio() -> None:
@@ -83,6 +87,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"  {badge} {item['msg']}")
     print("------------------------------------------------------------")
     print(f"  Índice de Saúde de Tokens: {score}/100")
+    payload = collect_real_metrics()
+    recs = recommendations_from_report(payload["report"]) if payload else []
+    if recs:
+        print("------------------------------------------------------------")
+        print(f"  RECOMENDAÇÕES A PARTIR DO SEU USO REAL (custo medido: ${payload['report']['total_cost']:,.2f}):")
+        for rec in recs:
+            print(f"  • {rec}")
     print("============================================================")
     return 0
 
@@ -96,64 +107,18 @@ def cmd_stats(args: argparse.Namespace) -> int:
         deleted = db.reset_telemetry()
         print(f"[✓] Histórico de telemetria zerado ({deleted} registros removidos).")
 
-    html_path = write_static_dashboard_html(db)
-    payload = collect_full_dashboard_payload(db)
-    h = payload["headline"]
-    cc = payload["claude_cache"]
+    payload = collect_real_metrics(db)
+    print(format_stats_text(payload))
+    print(f"  Painel visual: {write_static_dashboard_html(db, fast_mode=True)}")
+    return 0
 
-    print("============================================================")
-    print("  ⚡ CATO STATS — Telemetria Real de Economia de Tokens")
-    print("============================================================")
-    print(f"  📅 HOJE ({h['today_label']}):")
-    print(f"     • Intervenções Hoje  : {h['today_cato_events']}x")
-    print(f"     • Tokens Brutos Hoje : {h['today_cato_raw']:,} -> {h['today_cato_opt']:,} entregues")
-    print(f"     • Salvos Hoje (CATO) : -{h['today_cato_saved']:,} tokens (-{h['today_reduction_pct']:.1f}%)")
-    print(
-        f"     • Economia Hoje ($)  : ${h['today_sonnet_usd']:.4f} (Sonnet $3/1M) | "
-        f"${h['today_opus_usd']:.4f} (Opus $15/1M)"
-    )
-    print("------------------------------------------------------------")
-    print("  🌎 NO GERAL (ACUMULADO CATO):")
-    print(f"     • Intervenções Geral : {h['total_events']}x")
-    print(f"     • Tokens Brutos Geral: {h['cato_raw_tokens']:,} -> {h['cato_optimized_tokens']:,} entregues")
-    print(f"     • Salvos Geral (CATO): -{h['cato_saved_tokens']:,} tokens (-{h['reduction_pct']:.1f}%)")
-    print(
-        f"     • Economia Geral ($) : ${h['sonnet_usd_saved']:.4f} (Sonnet $3/1M) | "
-        f"${h['opus_usd_saved']:.4f} (Opus $15/1M)"
-    )
-    print(
-        f"     • Prompt Cache Hit   : {cc['cache_hit_rate_pct']:.1f}% "
-        f"({cc['cache_read_input_tokens']:,} tokens únicos lidos a 0.1x em {cc['sessions_scanned']} sessões)"
-    )
-    print(f"     • Painel Visual HTML : {html_path}")
-    print("------------------------------------------------------------")
 
-    daily_hist = payload.get("daily_history", [])
-    if daily_hist:
-        print("  📆 Histórico por Dia (CATO):")
-        for d in daily_hist[:7]:
-            tag = " [HOJE]" if d.get("is_today") else "       "
-            print(
-                f"    • {d['date_label']}{tag} | {d['cato_events']:>3}x | "
-                f"-{d['cato_saved']:>8,} tok ({d.get('cato_raw', 0):,} -> {d.get('cato_opt', 0):,}) | "
-                f"${d['opus_usd']:.4f}"
-            )
-        print("------------------------------------------------------------")
-
-    by_type = payload["cato"].get("by_type", [])
-    if by_type:
-        print("  ⚙️ Detalhamento por Motor de Otimização (CATO):")
-        for row in by_type:
-            r_raw = row["raw_tokens"]
-            r_saved = row["saved_tokens"]
-            r_pct = (r_saved / r_raw * 100.0) if r_raw > 0 else 0.0
-            print(
-                f"    • {row['event_type']:<24} | {row['count']:>4}x | "
-                f"-{r_saved:,} tokens (-{r_pct:.1f}%)"
-            )
+def cmd_report(args: argparse.Namespace) -> int:
+    report = build_report(days=args.days, project=args.project)
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
-        print("  Nenhuma intervenção registrada ainda.")
-    print("============================================================")
+        print(format_report_text(report))
     return 0
 
 
@@ -167,7 +132,15 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
 
 def cmd_statusline() -> int:
-    print(format_statusline_text())
+    # O Claude Code envia o estado da sessão (com `transcript_path`) em JSON no stdin da statusLine
+    status_input = None
+    if not sys.stdin.isatty():
+        try:
+            raw = sys.stdin.read()
+            status_input = json.loads(raw) if raw.strip() else None
+        except Exception:
+            status_input = None
+    print(format_statusline_text(status_input=status_input))
     return 0
 
 
@@ -300,6 +273,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_stats.add_argument("--clear-reads", action="store_true", help="Limpa o cache de deduplicação de leituras")
     p_stats.add_argument("--reset", action="store_true", help="Zera o histórico de telemetria de economia de tokens")
 
+    # cato report
+    p_rep = sub.add_parser("report", help="Custo REAL dos transcripts do Claude Code (tokens faturados x preço oficial)")
+    p_rep.add_argument("--days", type=float, default=None, help="Só os últimos N dias (padrão: todo o histórico)")
+    p_rep.add_argument("--project", default=None, help="Filtra pelo nome da pasta do projeto em ~/.claude/projects")
+    p_rep.add_argument("--json", action="store_true", help="Saída em JSON")
+
     # cato dashboard
     p_dash = sub.add_parser("dashboard", help="Abre o Painel Visual Web de Economia de Tokens em tempo real")
     p_dash.add_argument("--port", type=int, default=8765, help="Porta HTTP local (padrão: 8765)")
@@ -345,7 +324,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_hook = sub.add_parser("hook", help="Endpoints internos chamados pelos Hooks do Claude Code via stdio")
     p_hook.add_argument(
         "event",
-        choices=["pre-tool-use", "post-tool-use", "pre-compact", "session-reset"],
+        choices=["pre-tool-use", "post-tool-use", "user-prompt-submit", "pre-compact", "session-reset"],
         help="Nome do evento do hook",
     )
 
@@ -363,6 +342,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_doctor(args)
     if args.subcommand == "stats":
         return cmd_stats(args)
+    if args.subcommand == "report":
+        return cmd_report(args)
     if args.subcommand == "dashboard":
         return cmd_dashboard(args)
     if args.subcommand == "statusline":
@@ -386,6 +367,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return pre_tool_use_stdio()
         if args.event == "post-tool-use":
             return post_tool_use_stdio()
+        if args.event == "user-prompt-submit":
+            return user_prompt_submit_stdio()
         if args.event == "pre-compact":
             return session_lifecycle_stdio(mode="pre-compact")
         if args.event == "session-reset":

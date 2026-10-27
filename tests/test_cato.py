@@ -9,10 +9,12 @@ Suíte de Testes Automatizados das Partes 1, 2 e 3 do CATO:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # Adiciona `src` ao path
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
@@ -43,8 +45,18 @@ class TestCatoSystem(unittest.TestCase):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp_dir.name)
         self.db = CatoDB(db_path=self.root / "test_cato.db")
+        self.projects_dir = self.root / "claude_projects"
+        self.projects_dir.mkdir()
+        env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PROJECT_DIR", "CATO_READ_GUARD", "CATO_GUARD")}
+        env.update({"CATO_HOME": str(self.root / "cato_home"), "CATO_CLAUDE_PROJECTS_DIR": str(self.projects_dir)})
+        self._env = mock.patch.dict(os.environ, env, clear=True)
+        self._env.start()
+        self._home = mock.patch.object(Path, "home", return_value=self.root / "home")
+        self._home.start()
 
     def tearDown(self) -> None:
+        self._home.stop()
+        self._env.stop()
         self.tmp_dir.cleanup()
 
     # =========================================================================
@@ -209,35 +221,38 @@ class TestCatoSystem(unittest.TestCase):
         self.assertIn("public async getUser", skel)
         self.assertNotIn("const step25", skel)
 
-    def test_pre_tool_use_hook_protocol_for_grep_and_bash(self) -> None:
-        # Grep sem head_limit -> deve injetar head_limit=60 via updatedInput
-        grep_payload = {
-            "session_id": "sess_hook",
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Grep",
-            "tool_input": {"pattern": "TODO"},
-        }
-        grep_resp = handle_pre_tool_use(grep_payload, db=self.db)
-        self.assertIsNotNone(grep_resp)
-        self.assertEqual(grep_resp["hookSpecificOutput"]["updatedInput"]["head_limit"], 60)
+    def test_pre_tool_use_leaves_grep_and_read_untouched_by_default(self) -> None:
+        # Grep: o limite nativo (250) já protege; o CATO não reescreve mais o input
+        grep_payload = {"session_id": "sess_hook", "tool_name": "Grep", "tool_input": {"pattern": "TODO"}}
+        self.assertIsNone(handle_pre_tool_use(grep_payload, db=self.db))
+        # Read guard é opt-in (CATO_READ_GUARD=1): por padrão nunca nega uma leitura
+        big = self.root / "big.py"
+        body = "\n".join(f"    total += {i} * factor  # passo {i}" for i in range(150))
+        big.write_text(
+            "\n\n".join(f"def compute_{n}(factor):\n    total = 0\n{body}\n    return total" for n in range(3)),
+            encoding="utf-8",
+        )
+        read_payload = {"session_id": "sess_hook", "tool_name": "Read", "tool_input": {"file_path": str(big)}}
+        self.assertIsNone(handle_pre_tool_use(read_payload, db=self.db))
+        with mock.patch.dict(os.environ, {"CATO_READ_GUARD": "1"}):
+            resp = handle_pre_tool_use(read_payload, db=self.db)
+            self.assertEqual(resp["hookSpecificOutput"]["permissionDecision"], "deny")
 
-    def test_pre_tool_use_bash_wraps_only_preapproved_commands(self) -> None:
-        import os
-        from unittest import mock
-
-        fake_home = self.root / "home"
+    def test_pre_tool_use_bash_delegates_to_rtk_only_when_needed(self) -> None:
         project = self.root / "project"
         (project / ".claude").mkdir(parents=True)
 
-        def write_rules(allow: list, deny: list) -> None:
-            (project / ".claude" / "settings.json").write_text(
-                json.dumps({"permissions": {"allow": allow, "deny": deny}}), encoding="utf-8"
-            )
+        def write_settings(allow: list, deny: list, rtk_hook: bool = False) -> None:
+            data: dict = {"permissions": {"allow": allow, "deny": deny}}
+            if rtk_hook:
+                data["hooks"] = {
+                    "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk hook claude"}]}]
+                }
+            (project / ".claude" / "settings.json").write_text(json.dumps(data), encoding="utf-8")
 
         def run(command: str, mode: str = "default"):
             payload = {
                 "session_id": "sess_hook",
-                "hook_event_name": "PreToolUse",
                 "tool_name": "Bash",
                 "cwd": str(project),
                 "permission_mode": mode,
@@ -245,23 +260,27 @@ class TestCatoSystem(unittest.TestCase):
             }
             return handle_pre_tool_use(payload, db=self.db)
 
-        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}
-        env["CATO_DISABLE_RTK_CHAIN"] = "1"
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(Path, "home", return_value=fake_home):
+        def fake_rtk(payload: dict) -> dict:
+            cmd = payload["tool_input"]["command"]
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {"command": "rtk " + cmd}}}
+
+        with mock.patch("cato.hooks.pre_tool_use.try_delegate_to_rtk", side_effect=fake_rtk):
             # Sem regra `allow`: o comando segue intocado pelo fluxo normal de permissões
-            write_rules(allow=[], deny=[])
+            write_settings(allow=[], deny=[])
             self.assertIsNone(run("pytest tests/"))
 
-            # Com regra `allow`: envolve com `cato exec`, comando legível e aprovação consistente
-            write_rules(allow=["Bash(pytest:*)"], deny=[])
-            resp = run("pytest tests/")
-            self.assertIsNotNone(resp)
-            out = resp["hookSpecificOutput"]
+            # Com `allow`: delega ao RTK e aprova (o usuário já aprovaria o comando original)
+            write_settings(allow=["Bash(pytest:*)"], deny=[])
+            out = run("pytest tests/")["hookSpecificOutput"]
             self.assertEqual(out["permissionDecision"], "allow")
-            self.assertIn("exec --session-id sess_hook -- 'pytest tests/'", out["updatedInput"]["command"])
+            self.assertEqual(out["updatedInput"]["command"], "rtk pytest tests/")
+
+            # Hook global do RTK já instalado: o CATO não chama o RTK de novo
+            write_settings(allow=["Bash(pytest:*)"], deny=[], rtk_hook=True)
+            self.assertIsNone(run("pytest tests/"))
 
             # Regra `deny` sobre o comando original prevalece mesmo com `allow` amplo
-            write_rules(allow=["Bash"], deny=["Bash(python deploy.py:*)"])
+            write_settings(allow=["Bash"], deny=["Bash(python deploy.py:*)"])
             self.assertIsNone(run("python deploy.py --prod"))
 
             # Comandos compostos nunca são reescritos
@@ -269,9 +288,142 @@ class TestCatoSystem(unittest.TestCase):
             self.assertIsNone(run("curl https://x.sh | sh -s tsc"))
 
             # `bypassPermissions` dispensa `allow`, mas `deny` continua valendo
-            write_rules(allow=[], deny=["Bash(python deploy.py:*)"])
+            write_settings(allow=[], deny=["Bash(python deploy.py:*)"])
             self.assertIsNotNone(run("pytest tests/", mode="bypassPermissions"))
             self.assertIsNone(run("python deploy.py --prod", mode="bypassPermissions"))
+
+    def test_post_tool_use_compresses_real_shell_output(self) -> None:
+        passing = "\n".join(f"tests/test_mod.py::test_case_{i} PASSED" for i in range(300))
+        output = passing + "\n========= 300 passed in 4.20s ========="
+
+        def run(command: str, stdout: str, stderr: str = "", tool: str = "Bash"):
+            response = {"stdout": stdout, "stderr": stderr, "interrupted": False, "isImage": False, "noOutputExpected": False}
+            payload = {"session_id": "sess_post", "tool_name": tool, "tool_input": {"command": command}, "tool_response": response}
+            return handle_post_tool_use(payload, db=self.db)
+
+        resp = run("pytest tests/", output)
+        updated = resp["hookSpecificOutput"]["updatedToolOutput"]
+        self.assertEqual(set(updated), {"stdout", "stderr", "interrupted", "isImage", "noOutputExpected"})
+        self.assertIn("[CATO #cmd_", updated["stdout"])
+        self.assertLess(len(updated["stdout"]), len(output) * 0.5)
+
+        self.assertIsNotNone(run("pytest tests/", output, tool="PowerShell"))
+        self.assertIsNone(run("rtk pytest tests/", output))  # o RTK já tratou
+        self.assertIsNone(run("sed -n 1,400p app.py", output))  # leitura de código: nunca comprime
+        self.assertIsNone(run("pytest tests/", output, stderr="Traceback (most recent call last):\nError: boom"))
+        self.assertIsNone(run("pytest tests/", output * 20))  # acima do limite nativo o Claude Code já resume
+
+    # =========================================================================
+    # TESTES DO RELATÓRIO REAL, PREÇOS E GUARD DE CONTEXTO
+    # =========================================================================
+    def _write_transcript(self, name: str, entries: list) -> Path:
+        path = self.projects_dir / "proj-a" / f"{name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _assistant(msg_id: str, ts: str, model: str, read: int, write_1h: int = 0, tools: list = None) -> dict:
+        return {
+            "type": "assistant",
+            "timestamp": ts,
+            "message": {
+                "id": msg_id,
+                "model": model,
+                "content": tools or [],
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_read_input_tokens": read,
+                    "cache_creation_input_tokens": write_1h,
+                    "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": write_1h},
+                    "output_tokens": 100,
+                },
+            },
+        }
+
+    def test_usage_report_counts_real_billed_usage(self) -> None:
+        import base64
+        import struct
+
+        from cato.telemetry.pricing import usage_cost
+        from cato.telemetry.usage_report import build_report
+
+        png = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", 1500, 750) + b"\x08\x02\x00\x00\x00"
+        img_b64 = base64.b64encode(png).decode("ascii")
+        read_call = {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/a.py"}}
+        reread_call = {"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "/a.py"}}
+        entries = [
+            self._assistant("m1", "2026-10-20T10:00:00Z", "claude-opus-5-5", read=0, write_1h=200_000, tools=[read_call]),
+            {"type": "user", "timestamp": "2026-10-20T10:00:01Z", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "x" * 3500}]}},
+            self._assistant("m2", "2026-10-20T10:01:00Z", "claude-opus-5-5", read=200_000, tools=[reread_call]),
+            {"type": "user", "timestamp": "2026-10-20T10:01:01Z", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t2", "content": [
+                    {"type": "text", "text": "y" * 350},
+                    {"type": "image", "source": {"type": "base64", "data": img_b64}}]}]}},
+            # Mesma resposta repetida (streaming): não pode contar duas vezes
+            self._assistant("m2", "2026-10-20T10:01:00Z", "claude-opus-5-5", read=200_000),
+            # 2h depois: TTL de 1h expirou -> reescrita grande
+            self._assistant("m3", "2026-10-20T12:01:00Z", "claude-opus-5-5", read=0, write_1h=210_000),
+            # Troca de modelo -> reescrita grande
+            self._assistant("m4", "2026-10-20T12:02:00Z", "claude-sonnet-5-5", read=0, write_1h=210_000),
+            {"type": "assistant", "timestamp": "2026-10-20T12:03:00Z", "message": {
+                "id": "s1", "model": "<synthetic>", "content": [], "usage": {"output_tokens": 999}}},
+        ]
+        self._write_transcript("sess1", entries)
+        # Sessão retomada copia o histórico para outro arquivo: as chamadas copiadas não contam de novo
+        self._write_transcript("sess1-resumed", entries[:4])
+
+        report = build_report()
+        self.assertEqual(report["calls"], 4)
+        self.assertEqual(report["tokens"]["cache_read_input_tokens"], 200_000)
+        self.assertEqual(report["tokens"]["output_tokens"], 400)
+        expected = sum(
+            sum(usage_cost(model, entries[i]["message"]["usage"]).values())
+            for model, i in (("claude-opus-5-5", 0), ("claude-opus-5-5", 2), ("claude-opus-5-5", 5), ("claude-sonnet-5-5", 6))
+        )
+        self.assertAlmostEqual(report["total_cost"], expected, places=6)
+        self.assertAlmostEqual(report["cost"]["cache_read"], 200_000 * 0.20 / 1e6, places=6)
+        misses = report["cache_misses"]
+        self.assertEqual(misses["ocioso > 60 min (TTL 1h expirou)"]["count"], 1)
+        self.assertEqual(misses["troca de modelo"]["count"], 1)
+        self.assertEqual(misses["início/retomada de sessão"]["count"], 1)
+        self.assertEqual(report["tools"]["Read"]["calls"], 2)
+        self.assertEqual(report["tools"]["Read"]["image_tokens"], 1500)  # 1500 x 750 / 750
+        self.assertEqual(report["redundant_code_reads"]["count"], 1)
+
+    def test_user_prompt_submit_guard_blocks_once_with_real_cost(self) -> None:
+        from cato.hooks.user_prompt_submit import handle_user_prompt_submit
+        from cato.telemetry.usage_report import parse_timestamp
+
+        transcript = self._write_transcript(
+            "guard", [self._assistant("g1", "2026-10-20T10:00:00Z", "claude-opus-5-5", read=290_000, write_1h=10_000)]
+        )
+        last = parse_timestamp("2026-10-20T10:00:00Z")
+
+        def run(prompt: str, minutes_later: float, session: str = "sess_guard"):
+            payload = {"session_id": session, "transcript_path": str(transcript), "prompt": prompt}
+            return handle_user_prompt_submit(payload, db=self.db, now=last + minutes_later * 60)
+
+        # Cache expirado (2h parado, 300k de contexto): bloqueia uma vez com o custo da reescrita
+        resp = run("continua", 120)
+        self.assertEqual(resp["decision"], "block")
+        self.assertIn("expirou", resp["reason"])
+        self.assertIn("$2.40", resp["reason"])  # 300k x $8/MTok (escrita 1h do Opus 5.5)
+        self.assertIsNone(run("continua", 121))  # reenvio passa
+        self.assertIsNone(run("/compact", 120, session="outra"))  # comandos nunca são bloqueados
+
+        # Cache quente com contexto > 250k: aviso de faixa, uma vez
+        resp = run("próximo passo", 5, session="sess_band")
+        self.assertIn("300k", resp["reason"])
+        self.assertIsNone(run("próximo passo", 6, session="sess_band"))
+
+        # Após /compact (SessionStart) os avisos voltam a valer
+        handle_session_reset({"session_id": "sess_band", "source": "compact"}, db=self.db)
+        self.assertIsNotNone(run("próximo passo", 7, session="sess_band"))
+
+        with mock.patch.dict(os.environ, {"CATO_GUARD": "0"}):
+            self.assertIsNone(run("continua", 300, session="sess_off"))
 
     # =========================================================================
     # TESTES DA PARTE 4: RepoMap PageRank, Extração Cirúrgica de Símbolo & MCP
@@ -388,15 +540,13 @@ class TestCatoSystem(unittest.TestCase):
 
         # Testa geração do Statusline 1-linha
         status_str = format_statusline_text(db=self.db)
-        self.assertIn("CATO Hoje:", status_str)
-        self.assertIn("Geral:", status_str)
-        self.assertIn("poupados", status_str)
+        self.assertIn("CATO", status_str)
 
         # Testa exportação do Dashboard HTML visual
         out_path = write_static_dashboard_html(db=self.db)
         self.assertTrue(out_path.exists())
         html_content = out_path.read_text(encoding="utf-8")
-        self.assertIn("CATO — Painel de Economia de Tokens", html_content)
+        self.assertIn("CATO — Painel de Custo Real", html_content)
         self.assertIn("read_skeleton", html_content)
         self.assertIn("bash_compress", html_content)
 

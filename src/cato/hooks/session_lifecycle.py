@@ -64,6 +64,7 @@ def handle_session_reset(payload: Dict[str, Any], db: Optional[CatoDB] = None) -
     source = str(payload.get("source", ""))
     db_instance = db or CatoDB()
     cleared = db_instance.clear_session_reads(session_id)
+    db_instance.clear_guard_acks(session_id)
 
     reinjected_context: Optional[str] = None
     if source == "compact":

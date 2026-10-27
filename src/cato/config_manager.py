@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from cato.hooks.pre_tool_use import get_cato_executable_cmd
 
@@ -78,14 +78,18 @@ cato stats
 
 def _ensure_hook_entry(
     hooks_list: List[Dict[str, Any]],
-    matcher: str,
+    matcher: Optional[str],
     command: str,
     marker: str = "cato",
 ) -> List[Dict[str, Any]]:
     """
     Atualiza ou adiciona um hook do CATO na lista de um evento sem duplicar entradas existentes
-    e preservando outros hooks do usuário (como `rtk hook claude`).
+    e preservando outros hooks do usuário (como `rtk hook claude`). `matcher=None` omite o campo
+    (eventos sem matcher, como `UserPromptSubmit`).
     """
+    entry: Dict[str, Any] = {"hooks": [{"type": "command", "command": command}]}
+    if matcher is not None:
+        entry = {"matcher": matcher, **entry}
     updated = False
     new_list: List[Dict[str, Any]] = []
 
@@ -94,23 +98,13 @@ def _ensure_hook_entry(
         is_cato_item = any(marker in str(h.get("command", "")).lower() for h in inner_hooks)
         if is_cato_item:
             if not updated:
-                new_list.append(
-                    {
-                        "matcher": matcher,
-                        "hooks": [{"type": "command", "command": command}],
-                    }
-                )
+                new_list.append(entry)
                 updated = True
         else:
             new_list.append(item)
 
     if not updated:
-        new_list.append(
-            {
-                "matcher": matcher,
-                "hooks": [{"type": "command", "command": command}],
-            }
-        )
+        new_list.append(entry)
     return new_list
 
 
@@ -142,17 +136,23 @@ def build_merged_settings(existing: Dict[str, Any]) -> Dict[str, Any]:
     post_cmd = f"{cato_cmd} hook post-tool-use"
     compact_cmd = f"{cato_cmd} hook pre-compact"
     session_cmd = f"{cato_cmd} hook session-reset"
+    prompt_cmd = f"{cato_cmd} hook user-prompt-submit"
 
     hooks_root = merged.setdefault("hooks", {})
     hooks_root["PreToolUse"] = _ensure_hook_entry(
         list(hooks_root.get("PreToolUse", [])),
-        matcher="Read|Grep|Bash",
+        matcher="Read|Bash",
         command=pre_cmd,
     )
     hooks_root["PostToolUse"] = _ensure_hook_entry(
         list(hooks_root.get("PostToolUse", [])),
-        matcher="Edit|Write|MultiEdit|mcp__.*",
+        matcher="Edit|Write|MultiEdit|Bash|PowerShell|mcp__.*",
         command=post_cmd,
+    )
+    hooks_root["UserPromptSubmit"] = _ensure_hook_entry(
+        list(hooks_root.get("UserPromptSubmit", [])),
+        matcher=None,
+        command=prompt_cmd,
     )
     hooks_root["PreCompact"] = _ensure_hook_entry(
         list(hooks_root.get("PreCompact", [])),
@@ -311,19 +311,32 @@ def audit_environment(project_root: Path) -> Tuple[int, List[Dict[str, str]]]:
     has_cato_hook = any("cato" in c.lower() for c in hook_cmds)
     has_rtk_hook = any("rtk" in c.lower() for c in hook_cmds)
 
+    prompt_hooks = combined_settings.get("hooks", {}).get("UserPromptSubmit", [])
+    has_guard = any("cato" in str(h.get("command", "")).lower() for e in prompt_hooks for h in e.get("hooks", []))
+
     if has_cato_hook:
-        findings.append({"level": "OK", "msg": "Hook CATO PreToolUse ativo (Read AST/Dedup + Grep Limit + Bash Optimizer)."})
+        findings.append({"level": "OK", "msg": "Hook CATO PreToolUse ativo (delegação ao RTK com gate de permissões)."})
     else:
         score -= 25
         findings.append(
             {
                 "level": "WARN",
-                "msg": "Hook CATO PreToolUse ainda não ativo neste escopo (`Read` e `Grep` estão sem proteção contra bloat).",
+                "msg": "Hooks do CATO ainda não ativos neste escopo. Rode `cato init`.",
+            }
+        )
+    if has_guard:
+        findings.append({"level": "OK", "msg": "Guard de contexto/cache (UserPromptSubmit) ativo."})
+    elif has_cato_hook:
+        score -= 15
+        findings.append(
+            {
+                "level": "WARN",
+                "msg": "Guard de contexto/cache (UserPromptSubmit) ausente — é a maior alavanca medida. Rode `cato init` de novo.",
             }
         )
 
     if has_rtk_hook:
-        findings.append({"level": "OK", "msg": "Hook RTK (`rtk hook claude`) detectado em PreToolUse (encadeado com CATO)."})
+        findings.append({"level": "OK", "msg": "Hook RTK (`rtk hook claude`) detectado: o RTK reescreve comandos, o CATO não o chama de novo."})
 
     # 4. Verifica model & effortLevel (alerta sobre Opus + xhigh)
     model = combined_settings.get("model", "")

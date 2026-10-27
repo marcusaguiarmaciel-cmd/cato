@@ -30,7 +30,6 @@ def execute_and_optimize(
     session = session_id or os.environ.get("CLAUDE_SESSION_ID", "default")
     db_instance = db or CatoDB()
 
-    start_ts = time.time()
     try:
         # No Windows, o Claude Code executa comandos da ferramenta Bash via Git Bash (/usr/bin/bash).
         # Usamos o Git Bash se presente para suportar caminhos POSIX (/c/Users/...), export, tail, etc.
@@ -66,50 +65,8 @@ def execute_and_optimize(
         sys.stderr.write(f"[CATO Exec Error] Falha ao executar comando: {exc}\n")
         return 1
 
-    raw_tokens = estimate_tokens(combined_output)
-
-    # Se a saída for pequena (< 160 tokens / ~600 chars), entrega diretamente sem tocar
-    if raw_tokens < 160:
-        if combined_output:
-            sys.stdout.write(combined_output)
-            if not combined_output.endswith("\n"):
-                sys.stdout.write("\n")
-        return exit_code
-
-    optimized_output, was_modified, strategy = optimize_command_output(command, combined_output)
-    optimized_tokens = estimate_tokens(optimized_output)
-
-    # Só substitui se realmente economizou pelo menos 15% dos tokens ou >80 tokens
-    if was_modified and (raw_tokens - optimized_tokens >= 80 or optimized_tokens <= int(raw_tokens * 0.85)):
-        log_hash = hashlib.sha256(f"{start_ts}:{command}".encode("utf-8")).hexdigest()[:8]
-        log_id = f"cmd_{log_hash}"
-        log_file: Path = get_logs_dir() / f"{log_id}.log"
-        log_file.write_text(combined_output, encoding="utf-8")
-
-        footer = (
-            f"\n[CATO #{log_id} ({strategy}): {raw_tokens} -> {optimized_tokens} tokens "
-            f"(-{raw_tokens - optimized_tokens} tok). Log bruto completo: {log_file}]"
-        )
-        final_text = optimized_output + footer
-        final_tokens = estimate_tokens(final_text)
-
-        db_instance.record_command_log(
-            log_id=log_id,
-            session_id=session,
-            command=command,
-            exit_code=exit_code,
-            raw_log_path=str(log_file),
-            raw_tokens=raw_tokens,
-            compressed_tokens=final_tokens,
-        )
-        db_instance.record_telemetry(
-            session_id=session,
-            event_type=f"bash_{strategy}",
-            tool_name="Bash",
-            target=command,
-            raw_tokens=raw_tokens,
-            optimized_tokens=final_tokens,
-        )
+    final_text = compress_and_record(command, combined_output, session, db_instance, exit_code=exit_code)
+    if final_text is not None:
         sys.stdout.write(final_text + "\n")
     else:
         sys.stdout.write(combined_output)
@@ -117,3 +74,65 @@ def execute_and_optimize(
             sys.stdout.write("\n")
 
     return exit_code
+
+
+def native_output_limit() -> int:
+    """Limite em caracteres a partir do qual o Claude Code troca a saída do Bash por arquivo + prévia."""
+    try:
+        return int(os.environ.get("BASH_MAX_OUTPUT_LENGTH") or 30_000)
+    except ValueError:
+        return 30_000
+
+
+def compress_and_record(
+    command: str,
+    output: str,
+    session_id: str,
+    db: CatoDB,
+    exit_code: int = 0,
+    tool_name: str = "Bash",
+) -> Optional[str]:
+    """
+    Comprime `output` e devolve o texto final (com rodapé e log bruto salvo em `~/.cato/logs/`),
+    ou `None` quando não vale a pena: saída pequena, ganho < 15% (e < 80 tokens) ou saída acima do
+    limite nativo — nesse caso o Claude Code já entrega só um arquivo + prévia, o que é menor.
+    """
+    raw_tokens = estimate_tokens(output)
+    if raw_tokens < 160 or len(output) > native_output_limit():
+        return None
+
+    optimized_output, was_modified, strategy = optimize_command_output(command, output)
+    optimized_tokens = estimate_tokens(optimized_output)
+    if not was_modified or (raw_tokens - optimized_tokens < 80 and optimized_tokens > int(raw_tokens * 0.85)):
+        return None
+
+    log_hash = hashlib.sha256(f"{time.time()}:{command}".encode("utf-8")).hexdigest()[:8]
+    log_id = f"cmd_{log_hash}"
+    log_file: Path = get_logs_dir() / f"{log_id}.log"
+    log_file.write_text(output, encoding="utf-8")
+
+    footer = (
+        f"\n[CATO #{log_id} ({strategy}): {raw_tokens} -> {optimized_tokens} tokens "
+        f"(-{raw_tokens - optimized_tokens} tok). Log bruto completo: {log_file}]"
+    )
+    final_text = optimized_output + footer
+    final_tokens = estimate_tokens(final_text)
+
+    db.record_command_log(
+        log_id=log_id,
+        session_id=session_id,
+        command=command,
+        exit_code=exit_code,
+        raw_log_path=str(log_file),
+        raw_tokens=raw_tokens,
+        compressed_tokens=final_tokens,
+    )
+    db.record_telemetry(
+        session_id=session_id,
+        event_type=f"bash_{strategy}",
+        tool_name=tool_name,
+        target=command,
+        raw_tokens=raw_tokens,
+        optimized_tokens=final_tokens,
+    )
+    return final_text

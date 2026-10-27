@@ -1,17 +1,18 @@
 """
 Handler oficial do evento `PreToolUse` do Claude Code (Partes 2 e 3 do CATO).
 Intercepta:
-1. `Read`: Deduplicação SHA-256 por sessão + Esqueletonização AST automática para arquivos >300 linhas
-2. `Grep`: Injeta `head_limit: 60` via `updatedInput` quando omitido para evitar explosão de resultados
-3. `Bash`: Encadeia com `rtk` (se presente) ou envolve comandos verbosos no `cato exec` via `updatedInput`,
-   somente quando as regras de permissão do usuário já aprovariam o comando original
+1. `Read` (opt-in, `CATO_READ_GUARD=1`): Deduplicação SHA-256 por sessão + Esqueleto AST para arquivos >300 linhas.
+   Fica desligado por padrão: negar a leitura força outro turno, que relê o contexto inteiro, e o
+   Claude Code já devolve um aviso curto ao reler um arquivo sem mudanças.
+2. `Bash`: delega a reescrita ao RTK (`rtk hook claude`) somente quando o hook global do RTK não está
+   instalado (evita processar cada comando duas vezes) e o comando original já é aprovado pelas regras
+   do usuário. A compressão de saída do próprio CATO acontece no `PostToolUse`, sobre a saída real.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -19,89 +20,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from cato.code_intel.dedup import DEFAULT_SKELETON_LINE_THRESHOLD, evaluate_read_request
-from cato.hooks.bash_permissions import is_preapproved_bash_command
+from cato.hooks.bash_permissions import is_preapproved_bash_command, rtk_hook_installed
 from cato.storage.db import CatoDB
-
-# Comandos interativos ou triviais que NUNCA devem ser envolvidos pelo wrapper
-SKIP_BASH_PREFIXES = (
-    "rtk ",
-    "cato ",
-    "cd ",
-    "mkdir ",
-    "rm ",
-    "mv ",
-    "cp ",
-    "touch ",
-    "chmod ",
-    "chown ",
-    "export ",
-    "set ",
-    "echo ",
-    "pwd",
-    "which ",
-    "where ",
-    "kill ",
-    "git add",
-    "git commit",
-    "git checkout",
-    "git switch",
-    "git branch",
-    "git push",
-    "git pull",
-    "git fetch",
-    "git clone",
-    "git stash",
-    "git rm",
-    "git mv",
-)
-
-# Padrões de comandos que geram saídas potencialmente grandes e se beneficiam do `cato exec`
-OPTIMIZABLE_BASH_KEYWORDS = (
-    "pytest",
-    "py.test",
-    "unittest",
-    "jest",
-    "vitest",
-    "mocha",
-    "cargo test",
-    "cargo check",
-    "cargo build",
-    "go test",
-    "go build",
-    "npm test",
-    "npm run ",
-    "pnpm test",
-    "pnpm run ",
-    "yarn test",
-    "yarn build",
-    "tsc",
-    "eslint",
-    "ruff",
-    "flake8",
-    "mypy",
-    "pyright",
-    "clippy",
-    "git status",
-    "git diff",
-    "git log",
-    "git show",
-    "docker logs",
-    "docker compose logs",
-    "kubectl logs",
-    "pip install",
-    "npm install",
-    "pnpm install",
-    "find ",
-    "grep ",
-    "rg ",
-    "dir ",
-    "ls ",
-    "tree ",
-    "python ",
-    "python3 ",
-    "py ",
-    "node ",
-)
 
 
 def get_cato_executable_cmd() -> str:
@@ -112,29 +32,6 @@ def get_cato_executable_cmd() -> str:
     py_quoted = f'"{py_exe}"' if " " in py_exe else py_exe
     cli_quoted = f'"{cli_script}"' if " " in cli_script else cli_script
     return f"{py_quoted} {cli_quoted}"
-
-
-def should_wrap_bash_command(command: str) -> bool:
-    """Decide se um comando Bash deve ser envolvido pelo otimizador `cato exec`."""
-    cmd_stripped = command.strip()
-    if not cmd_stripped:
-        return False
-
-    cmd_lower = cmd_stripped.lower()
-    if any(cmd_lower.startswith(prefix) for prefix in SKIP_BASH_PREFIXES):
-        return False
-
-    # Não envolve comandos com heredoc (<<), scripts compostos com ';', pipes que já filtram (tail/head) ou background (&)
-    if (
-        "<<" in cmd_stripped
-        or ";" in cmd_stripped
-        or "| tail" in cmd_lower
-        or "| head" in cmd_lower
-        or cmd_stripped.endswith("&")
-    ):
-        return False
-
-    return any(kw in cmd_lower for kw in OPTIMIZABLE_BASH_KEYWORDS)
 
 
 def try_delegate_to_rtk(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -190,12 +87,13 @@ def handle_pre_tool_use(
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input") or {}
     session_id = payload.get("session_id") or os.environ.get("CLAUDE_SESSION_ID", "default")
-    db_instance = db or CatoDB()
 
     # =========================================================================
-    # 1. INTERCEPTAÇÃO DE `Read` (Deduplicação SHA-256 + Esqueleto AST)
+    # 1. `Read` (opt-in): Deduplicação SHA-256 + Esqueleto AST
     # =========================================================================
     if tool_name == "Read":
+        if os.environ.get("CATO_READ_GUARD") != "1":
+            return None
         file_path = tool_input.get("file_path") or tool_input.get("path")
         if not file_path:
             return None
@@ -210,7 +108,7 @@ def handle_pre_tool_use(
             limit=int(limit) if limit is not None else None,
             session_id=session_id,
             skeleton_threshold=threshold,
-            db=db_instance,
+            db=db or CatoDB(),
         )
 
         if not decision.allow:
@@ -221,73 +119,31 @@ def handle_pre_tool_use(
                     "permissionDecisionReason": decision.reason or "Blocked by CATO Read Guard",
                 }
             }
-
         if decision.additional_context:
+            # Sem `permissionDecision`: a leitura segue pelo fluxo normal de permissões
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
                     "additionalContext": decision.additional_context,
                 }
             }
         return None
 
     # =========================================================================
-    # 2. INTERCEPTAÇÃO DE `Grep` (Limite preventivo para evitar despejo massivo)
-    #    Nota: Não registra telemetria estimada/falsa antes da execução porque não
-    #    sabemos quantas linhas o Grep retornaria sem o head_limit.
-    # =========================================================================
-    if tool_name == "Grep":
-        head_limit = tool_input.get("head_limit")
-        if not head_limit:
-            updated_input = dict(tool_input)
-            updated_input["head_limit"] = 60
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "permissionDecisionReason": "CATO injected head_limit=60 to prevent unbounded Grep output",
-                    "updatedInput": updated_input,
-                }
-            }
-        return None
-
-    # =========================================================================
-    # 3. INTERCEPTAÇÃO DE `Bash` (Encadeamento RTK + Wrapper `cato exec`)
+    # 2. `Bash`: delegação ao RTK quando o hook global dele não está instalado
     # =========================================================================
     if tool_name == "Bash":
         command = str(tool_input.get("command", "")).strip()
-        if not command:
+        if not command or rtk_hook_installed(payload.get("cwd")):
             return None
-
-        # O Claude Code avalia as regras de permissão contra o comando reescrito; reescrever um comando
-        # que o usuário não aprovou esconderia o comando real das regras `deny`/`ask` e do prompt.
-        # Nesse caso o comando segue intocado pelo fluxo normal de permissões.
+        # O Claude Code avalia as regras de permissão contra o comando reescrito; só reescrevemos
+        # comandos que as regras do usuário já aprovam, senão o comando real escaparia de `deny`/`ask`.
         if not is_preapproved_bash_command(command, payload):
             return None
-
-        # Primeiro verifica se o RTK está ativo e deseja reescrever este comando nativamente
         rtk_result = try_delegate_to_rtk(payload)
         if rtk_result is not None:
             rtk_result.setdefault("hookSpecificOutput", {})["permissionDecision"] = "allow"
             return rtk_result
-
-        # Caso contrário, se for um comando candidato à otimização do CATO, envolve com `cato exec`.
-        # O comando vai entre aspas (legível no transcript), não codificado em base64.
-        if should_wrap_bash_command(command):
-            cato_cmd = get_cato_executable_cmd()
-            wrapped_command = f"{cato_cmd} exec --session-id {shlex.quote(str(session_id))} -- {shlex.quote(command)}"
-
-            updated_input = dict(tool_input)
-            updated_input["command"] = wrapped_command
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "permissionDecisionReason": "CATO wrapped a pre-approved command for deterministic output compression",
-                    "updatedInput": updated_input,
-                }
-            }
         return None
 
     return None

@@ -125,6 +125,13 @@ class CatoDB:
                     content
                 );
 
+                CREATE TABLE IF NOT EXISTS guard_acks (
+                    session_id TEXT NOT NULL,
+                    ack_key TEXT NOT NULL,
+                    timestamp REAL NOT NULL,
+                    PRIMARY KEY (session_id, ack_key)
+                );
+
                 CREATE TABLE IF NOT EXISTS compaction_snapshots (
                     session_id TEXT PRIMARY KEY,
                     timestamp REAL NOT NULL,
@@ -211,6 +218,27 @@ class CatoDB:
             cur = conn.execute("DELETE FROM telemetry_events")
             return cur.rowcount
 
+    def has_guard_ack(self, session_id: str, ack_key: str) -> bool:
+        """Indica se o usuário já viu (e ignorou) este aviso do guard nesta sessão."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM guard_acks WHERE session_id = ? AND ack_key = ?", (session_id, ack_key)
+            ).fetchone()
+            return row is not None
+
+    def add_guard_ack(self, session_id: str, ack_key: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO guard_acks (session_id, ack_key, timestamp) VALUES (?, ?, ?)",
+                (session_id, ack_key, time.time()),
+            )
+
+    def clear_guard_acks(self, session_id: str) -> int:
+        """Após /compact ou /clear o contexto encolhe: os avisos do guard voltam a valer."""
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM guard_acks WHERE session_id = ?", (session_id,))
+            return int(cur.rowcount or 0)
+
     def record_telemetry(
         self,
         session_id: str,
@@ -241,14 +269,7 @@ class CatoDB:
                 ),
             )
             row_id = int(cur.lastrowid or 0)
-
-        # Atualiza de forma ultrarrápida o arquivo HTML estático do dashboard (modo leve sem rglob pesado)
-        try:
-            from cato.telemetry.dashboard import write_static_dashboard_html
-
-            write_static_dashboard_html(self, fast_mode=True)
-        except Exception:
-            pass
+        # O painel HTML não é regenerado aqui: ele varre os transcripts reais e não pode rodar dentro de um hook.
         return row_id
 
     def store_sandbox_payload(
@@ -385,57 +406,9 @@ class CatoDB:
                 ),
             )
 
-    def _backfill_sliced_reads(self) -> None:
-        """Sincroniza leituras fatiadas existentes em `session_reads` para `telemetry_events` se ainda não registradas."""
-        with self._connect() as conn:
-            has_slice_ev = conn.execute(
-                "SELECT 1 FROM telemetry_events WHERE event_type = 'read_slice' LIMIT 1"
-            ).fetchone()
-            if has_slice_ev:
-                return
-            rows = conn.execute(
-                "SELECT * FROM session_reads WHERE read_mode = 'slice' ORDER BY first_read_at ASC"
-            ).fetchall()
-            seen_files: set[str] = set()
-            for r in rows:
-                fpath = Path(str(r["file_path"]))
-                if str(fpath) in seen_files or not fpath.exists() or not fpath.is_file():
-                    continue
-                seen_files.add(str(fpath))
-                try:
-                    src = fpath.read_text(encoding="utf-8", errors="replace")
-                    lines = src.splitlines()
-                    total_lines = len(lines)
-                    parts = str(r["file_key"]).rsplit(":", 2)
-                    s_idx, e_idx = int(parts[-2]), int(parts[-1])
-                    slice_txt = "\n".join(lines[s_idx:e_idx])
-                    raw_tok = estimate_tokens(src)
-                    opt_tok = estimate_tokens(slice_txt)
-                    saved_tok = max(0, raw_tok - opt_tok)
-                    if saved_tok >= 100:
-                        conn.execute(
-                            """
-                            INSERT INTO telemetry_events
-                            (timestamp, session_id, event_type, tool_name, target, raw_tokens, optimized_tokens, saved_tokens)
-                            VALUES (?, ?, 'read_slice', 'Read', ?, ?, ?, ?)
-                            """,
-                            (
-                                float(r["first_read_at"]),
-                                str(r["session_id"]),
-                                f"{fpath.name} (L{s_idx + 1}-L{e_idx} de {total_lines}L)",
-                                raw_tok,
-                                opt_tok,
-                                saved_tok,
-                            ),
-                        )
-                except Exception:
-                    continue
-
     def get_summary_stats(self) -> Dict[str, Any]:
         """Retorna estatísticas agregadas de economia de tokens (hoje, por dia, geral e por tipo)."""
         import datetime
-
-        self._backfill_sliced_reads()
 
         today_start_ts = datetime.datetime.now().replace(
             hour=0, minute=0, second=0, microsecond=0
@@ -449,7 +422,7 @@ class CatoDB:
                     COALESCE(SUM(raw_tokens), 0) as total_raw_tokens,
                     COALESCE(SUM(optimized_tokens), 0) as total_optimized_tokens,
                     COALESCE(SUM(saved_tokens), 0) as total_saved_tokens
-                FROM telemetry_events
+                FROM telemetry_events WHERE event_type NOT IN ('read_slice')
                 """
             ).fetchone()
 
@@ -460,8 +433,8 @@ class CatoDB:
                     COALESCE(SUM(raw_tokens), 0) as today_raw_tokens,
                     COALESCE(SUM(optimized_tokens), 0) as today_optimized_tokens,
                     COALESCE(SUM(saved_tokens), 0) as today_saved_tokens
-                FROM telemetry_events
-                WHERE timestamp >= ?
+                FROM telemetry_events WHERE event_type NOT IN ('read_slice')
+                AND timestamp >= ?
                 """,
                 (today_start_ts,),
             ).fetchone()
@@ -474,7 +447,7 @@ class CatoDB:
                     COALESCE(SUM(raw_tokens), 0) as raw_tokens,
                     COALESCE(SUM(optimized_tokens), 0) as optimized_tokens,
                     COALESCE(SUM(saved_tokens), 0) as saved_tokens
-                FROM telemetry_events
+                FROM telemetry_events WHERE event_type NOT IN ('read_slice')
                 GROUP BY date
                 ORDER BY date DESC
                 LIMIT 30
@@ -489,7 +462,7 @@ class CatoDB:
                     COALESCE(SUM(raw_tokens), 0) as raw_tokens,
                     COALESCE(SUM(optimized_tokens), 0) as optimized_tokens,
                     COALESCE(SUM(saved_tokens), 0) as saved_tokens
-                FROM telemetry_events
+                FROM telemetry_events WHERE event_type NOT IN ('read_slice')
                 GROUP BY event_type
                 ORDER BY saved_tokens DESC
                 """
@@ -498,7 +471,7 @@ class CatoDB:
             recent = conn.execute(
                 """
                 SELECT id, timestamp, event_type, tool_name, target, raw_tokens, optimized_tokens, saved_tokens
-                FROM telemetry_events
+                FROM telemetry_events WHERE event_type NOT IN ('read_slice')
                 ORDER BY id DESC
                 LIMIT 15
                 """

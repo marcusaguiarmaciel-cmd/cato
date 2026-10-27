@@ -42,6 +42,20 @@ def _settings_paths(cwd: Optional[str]) -> List[Path]:
     return paths
 
 
+def rtk_hook_installed(cwd: Optional[str] = None) -> bool:
+    """Indica se algum settings já registra o hook do RTK (`rtk hook claude`) em `PreToolUse`."""
+    for path in _settings_paths(cwd):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for item in (data.get("hooks") or {}).get("PreToolUse") or []:
+            for hook in item.get("hooks") or []:
+                if "rtk hook" in str(hook.get("command", "")).lower():
+                    return True
+    return False
+
+
 def load_bash_rules(cwd: Optional[str] = None) -> Dict[str, List[str]]:
     """Coleta as regras `allow`, `ask` e `deny` de todas as fontes de configuração."""
     rules: Dict[str, List[str]] = {"allow": [], "ask": [], "deny": []}

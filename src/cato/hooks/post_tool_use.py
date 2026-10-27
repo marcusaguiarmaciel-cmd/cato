@@ -3,7 +3,9 @@ Handler oficial do evento `PostToolUse` do Claude Code (Partes 4 e 5 do CATO).
 Responsabilidades:
 1. Verificador Sintático Instantâneo Zero-Turn após `Edit` / `Write` / `MultiEdit`
    (injeta erro exato via `additionalContext` no mesmo turno, poupando um turno inteiro de Bash).
-2. Virtualizador SQLite FTS5 (BM25) para respostas gigantes de ferramentas MCP (`mcp__.*`),
+2. Compressão da saída real de `Bash`/`PowerShell` via `updatedToolOutput` (sem reescrever o comando,
+   portanto sem afetar permissões), só para o que o RTK não tratou.
+3. Virtualizador SQLite FTS5 (BM25) para respostas gigantes de ferramentas MCP (`mcp__.*`),
    substituindo o payload bruto via `updatedMCPToolOutput` quando excede 1.500 tokens.
 """
 
@@ -13,14 +15,61 @@ import ast
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from cato.bash_optimizer.parsers import ERROR_SIGNAL_RE
+from cato.bash_optimizer.runner import compress_and_record
 from cato.storage.db import CatoDB, estimate_tokens
+from cato.telemetry.usage_report import is_rtk_command
 
 MCP_VIRTUALIZATION_TOKEN_THRESHOLD = 1500
+
+# Comandos cuja saída é código/conteúdo que o modelo pediu para ler: nunca comprimir
+CODE_READ_COMMANDS = {
+    "sed", "cat", "head", "tail", "less", "more", "nl", "awk", "grep", "egrep", "rg", "bat", "jq",
+    "get-content", "gc", "type", "select-string",
+}
+
+
+def _first_command_word(command: str) -> str:
+    cmd = re.sub(r"^(cd\s+[^&;]+(&&|;)\s*)+", "", command.strip())
+    first = cmd.split(None, 1)[0] if cmd else ""
+    return Path(first.strip("'\"").replace("\\", "/")).name.lower()
+
+
+def compress_shell_output(
+    tool_name: str,
+    tool_input: Dict[str, Any],
+    tool_response: Any,
+    session_id: str,
+    db: CatoDB,
+) -> Optional[Dict[str, Any]]:
+    """
+    Comprime a saída REAL de `Bash`/`PowerShell` via `updatedToolOutput`, no mesmo formato
+    (`{stdout, stderr, interrupted, isImage, ...}`). Não toca em: comandos já tratados pelo RTK,
+    leitura de código, saídas interrompidas/imagem, nem em erros (stderr com sinal de erro).
+    """
+    if os.environ.get("CATO_BASH_COMPRESS") == "0" or not isinstance(tool_response, dict):
+        return None
+    stdout = tool_response.get("stdout")
+    command = str(tool_input.get("command", ""))
+    if not isinstance(stdout, str) or tool_response.get("interrupted") or tool_response.get("isImage"):
+        return None
+    if is_rtk_command(command) or _first_command_word(command) in CODE_READ_COMMANDS:
+        return None
+    stderr = str(tool_response.get("stderr") or "")
+    if stderr.strip() and ERROR_SIGNAL_RE.search(stderr):
+        return None
+    final_text = compress_and_record(command, stdout, session_id, db, tool_name=tool_name)
+    if final_text is None:
+        return None
+    updated = dict(tool_response)
+    updated["stdout"] = final_text
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": updated}}
 
 
 def verify_file_syntax(file_path: str) -> Optional[str]:
@@ -72,6 +121,8 @@ SKIP_MCP_PREFIXES = (
     "mcp__chrome__",
     "mcp__browser__",
     "mcp__computer__",
+    "mcp__claude-in-chrome__",
+    "mcp__computer-use__",
 )
 
 
@@ -145,7 +196,13 @@ def handle_post_tool_use(
         return None
 
     # =========================================================================
-    # 2. VIRTUALIZAÇÃO SQLITE FTS5 PARA FERRAMENTAS MCP DE TEXTO (`mcp__.*`)
+    # 2. COMPRESSÃO DA SAÍDA REAL DE `Bash` / `PowerShell` (o que o RTK não tratou)
+    # =========================================================================
+    if tool_name in ("Bash", "PowerShell"):
+        return compress_shell_output(tool_name, tool_input, tool_response, session_id, db_instance)
+
+    # =========================================================================
+    # 3. VIRTUALIZAÇÃO SQLITE FTS5 PARA FERRAMENTAS MCP DE TEXTO (`mcp__.*`)
     #    Ignora ferramentas de navegador/screenshots (ex: `mcp__Claude_Browser__*`)
     # =========================================================================
     tool_lower = tool_name.lower()

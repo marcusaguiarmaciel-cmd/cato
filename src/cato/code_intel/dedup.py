@@ -166,21 +166,8 @@ def evaluate_read_request(
             )
 
     # 3. LEITURA CIRÚRGICA FATIADA (`offset` / `limit`) OU ARQUIVO PEQUENO
+    # (sem telemetria: "o arquivo inteiro menos a fatia" seria uma economia contrafactual, não medida)
     slice_lines = end_idx - start_idx
-    if is_sliced and total_lines > slice_lines:
-        full_file_tokens = estimate_tokens(source)
-        # Contabiliza a economia da leitura fatiada apenas na 1ª vez que o arquivo é fatiado na sessão
-        # (evitando somar o tamanho do arquivo inteiro múltiplas vezes se o Claude ler várias fatias)
-        if (full_file_tokens - raw_tokens >= 100) and not db_instance.has_file_path_read(session_id, norm_path):
-            db_instance.record_telemetry(
-                session_id=session_id,
-                event_type="read_slice",
-                tool_name="Read",
-                target=f"{path.name} (L{start_idx + 1}-L{end_idx} de {total_lines}L)",
-                raw_tokens=full_file_tokens,
-                optimized_tokens=raw_tokens,
-            )
-
     db_instance.upsert_session_read(
         session_id=session_id,
         file_key=file_key,

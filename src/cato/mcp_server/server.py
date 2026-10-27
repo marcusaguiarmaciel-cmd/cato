@@ -5,7 +5,7 @@ Expõe 4 ferramentas de alta eficiência de tokens ao Claude Code:
   1. `cato_repo_map`: Mapa de repositório AST ranqueado por Personalized PageRank
   2. `cato_read_symbol`: Leitura cirúrgica de função/classe/método por nome de símbolo
   3. `cato_search_sandbox`: Busca textual BM25 (SQLite FTS5) em payloads MCP ou logs brutos
-  4. `cato_token_savings`: Relatório em tempo real de tokens e dólares economizados
+  4. `cato_token_savings`: Custo real (tokens faturados x preço oficial), cache misses e contexto
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ MCP_TOOLS_SCHEMA: List[Dict[str, Any]] = [
     },
     {
         "name": "cato_token_savings",
-        "description": "Get real-time token and cost savings statistics recorded by CATO.",
+        "description": "Get the real API-equivalent cost of recent Claude Code sessions (billed usage x official prices), cache misses and context-size breakdown.",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -178,11 +178,11 @@ def execute_mcp_tool(
             return {"content": [{"type": "text", "text": text_res}], "isError": False}
 
         if name == "cato_token_savings":
-            from cato.telemetry.dashboard import collect_full_dashboard_payload
+            from cato.telemetry.dashboard import collect_real_metrics, format_stats_text
 
-            full_stats = collect_full_dashboard_payload(db_instance)
+            payload = collect_real_metrics(db_instance)
             return {
-                "content": [{"type": "text", "text": json.dumps(full_stats, indent=2, ensure_ascii=False)}],
+                "content": [{"type": "text", "text": format_stats_text(payload)}],
                 "isError": False,
             }
 
