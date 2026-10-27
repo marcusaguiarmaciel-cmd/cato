@@ -3,7 +3,8 @@ Handler oficial do evento `PreToolUse` do Claude Code (Partes 2 e 3 do CATO).
 Intercepta:
 1. `Read`: Deduplicação SHA-256 por sessão + Esqueletonização AST automática para arquivos >300 linhas
 2. `Grep`: Injeta `head_limit: 60` via `updatedInput` quando omitido para evitar explosão de resultados
-3. `Bash`: Encadeia com `rtk` (se presente) ou envolve comandos verbosos no `cato exec` via `updatedInput`
+3. `Bash`: Encadeia com `rtk` (se presente) ou envolve comandos verbosos no `cato exec` via `updatedInput`,
+   somente quando as regras de permissão do usuário já aprovariam o comando original
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from cato.code_intel.dedup import DEFAULT_SKELETON_LINE_THRESHOLD, evaluate_read_request
+from cato.hooks.bash_permissions import is_preapproved_bash_command
 from cato.storage.db import CatoDB
 
 # Comandos interativos ou triviais que NUNCA devem ser envolvidos pelo wrapper
@@ -258,19 +260,23 @@ def handle_pre_tool_use(
         if not command:
             return None
 
+        # O Claude Code avalia as regras de permissão contra o comando reescrito; reescrever um comando
+        # que o usuário não aprovou esconderia o comando real das regras `deny`/`ask` e do prompt.
+        # Nesse caso o comando segue intocado pelo fluxo normal de permissões.
+        if not is_preapproved_bash_command(command, payload):
+            return None
+
         # Primeiro verifica se o RTK está ativo e deseja reescrever este comando nativamente
         rtk_result = try_delegate_to_rtk(payload)
         if rtk_result is not None:
+            rtk_result.setdefault("hookSpecificOutput", {})["permissionDecision"] = "allow"
             return rtk_result
 
-        # Caso contrário, se for um comando candidato à otimização do CATO, envolve com `cato exec`
+        # Caso contrário, se for um comando candidato à otimização do CATO, envolve com `cato exec`.
+        # O comando vai entre aspas (legível no transcript), não codificado em base64.
         if should_wrap_bash_command(command):
             cato_cmd = get_cato_executable_cmd()
-            # Usa shlex.quote em ambientes POSIX; no Windows/Bash passa como argumento seguro em base64 ou escapado
-            import base64
-
-            b64_cmd = base64.b64encode(command.encode("utf-8")).decode("ascii")
-            wrapped_command = f"{cato_cmd} exec --session-id {session_id} --b64 {b64_cmd}"
+            wrapped_command = f"{cato_cmd} exec --session-id {shlex.quote(str(session_id))} -- {shlex.quote(command)}"
 
             updated_input = dict(tool_input)
             updated_input["command"] = wrapped_command
@@ -278,7 +284,7 @@ def handle_pre_tool_use(
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "allow",
-                    "permissionDecisionReason": "CATO wrapped command for deterministic output compression",
+                    "permissionDecisionReason": "CATO wrapped a pre-approved command for deterministic output compression",
                     "updatedInput": updated_input,
                 }
             }

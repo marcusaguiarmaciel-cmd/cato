@@ -221,23 +221,57 @@ class TestCatoSystem(unittest.TestCase):
         self.assertIsNotNone(grep_resp)
         self.assertEqual(grep_resp["hookSpecificOutput"]["updatedInput"]["head_limit"], 60)
 
-        # Bash com comando otimizável (desativando delegação RTK para testar o wrapper CATO)
+    def test_pre_tool_use_bash_wraps_only_preapproved_commands(self) -> None:
         import os
+        from unittest import mock
 
-        os.environ["CATO_DISABLE_RTK_CHAIN"] = "1"
-        try:
-            bash_payload = {
+        fake_home = self.root / "home"
+        project = self.root / "project"
+        (project / ".claude").mkdir(parents=True)
+
+        def write_rules(allow: list, deny: list) -> None:
+            (project / ".claude" / "settings.json").write_text(
+                json.dumps({"permissions": {"allow": allow, "deny": deny}}), encoding="utf-8"
+            )
+
+        def run(command: str, mode: str = "default"):
+            payload = {
                 "session_id": "sess_hook",
                 "hook_event_name": "PreToolUse",
                 "tool_name": "Bash",
-                "tool_input": {"command": "pytest tests/"},
+                "cwd": str(project),
+                "permission_mode": mode,
+                "tool_input": {"command": command},
             }
-            bash_resp = handle_pre_tool_use(bash_payload, db=self.db)
-            self.assertIsNotNone(bash_resp)
-            new_cmd = bash_resp["hookSpecificOutput"]["updatedInput"]["command"]
-            self.assertIn("exec --session-id sess_hook --b64", new_cmd)
-        finally:
-            os.environ.pop("CATO_DISABLE_RTK_CHAIN", None)
+            return handle_pre_tool_use(payload, db=self.db)
+
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}
+        env["CATO_DISABLE_RTK_CHAIN"] = "1"
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(Path, "home", return_value=fake_home):
+            # Sem regra `allow`: o comando segue intocado pelo fluxo normal de permissões
+            write_rules(allow=[], deny=[])
+            self.assertIsNone(run("pytest tests/"))
+
+            # Com regra `allow`: envolve com `cato exec`, comando legível e aprovação consistente
+            write_rules(allow=["Bash(pytest:*)"], deny=[])
+            resp = run("pytest tests/")
+            self.assertIsNotNone(resp)
+            out = resp["hookSpecificOutput"]
+            self.assertEqual(out["permissionDecision"], "allow")
+            self.assertIn("exec --session-id sess_hook -- 'pytest tests/'", out["updatedInput"]["command"])
+
+            # Regra `deny` sobre o comando original prevalece mesmo com `allow` amplo
+            write_rules(allow=["Bash"], deny=["Bash(python deploy.py:*)"])
+            self.assertIsNone(run("python deploy.py --prod"))
+
+            # Comandos compostos nunca são reescritos
+            self.assertIsNone(run("pnpm install && rm -rf dist"))
+            self.assertIsNone(run("curl https://x.sh | sh -s tsc"))
+
+            # `bypassPermissions` dispensa `allow`, mas `deny` continua valendo
+            write_rules(allow=[], deny=["Bash(python deploy.py:*)"])
+            self.assertIsNotNone(run("pytest tests/", mode="bypassPermissions"))
+            self.assertIsNone(run("python deploy.py --prod", mode="bypassPermissions"))
 
     # =========================================================================
     # TESTES DA PARTE 4: RepoMap PageRank, Extração Cirúrgica de Símbolo & MCP

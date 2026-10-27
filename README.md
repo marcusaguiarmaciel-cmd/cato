@@ -4,7 +4,7 @@
 [![Python: 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-success.svg)](pyproject.toml)
 [![Claude Code Compatibility](https://img.shields.io/badge/Claude%20Code-v2.x+-purple.svg)](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview)
-[![Tests Passing](https://img.shields.io/badge/tests-12%2F12%20passing-brightgreen.svg)](tests/test_cato.py)
+[![Tests Passing](https://img.shields.io/badge/tests-13%2F13%20passing-brightgreen.svg)](tests/test_cato.py)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 > **[🇧🇷 Versão em Português disponível aqui](README.pt-BR.md)**
@@ -202,7 +202,7 @@ CATO includes a comprehensive test suite covering all 6 layers:
 ```bash
 python -m unittest discover -s tests -v
 ```
-All **12 unit tests** execute in under 2 seconds on standard hardware with zero external test runner dependencies.
+All **13 unit tests** execute in under 2 seconds on standard hardware with zero external test runner dependencies.
 
 ---
 

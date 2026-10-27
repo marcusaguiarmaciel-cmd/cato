@@ -269,7 +269,10 @@ def cmd_exec(args: argparse.Namespace) -> int:
     if args.b64:
         command = base64.b64decode(args.b64.encode("ascii")).decode("utf-8")
     else:
-        command = " ".join(args.command).strip()
+        parts = list(args.command)
+        if parts and parts[0] == "--":
+            parts = parts[1:]
+        command = " ".join(parts).strip()
     if not command:
         return 0
     return execute_and_optimize(command=command, session_id=args.session_id)
