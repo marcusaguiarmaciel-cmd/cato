@@ -1,0 +1,48 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# CATO Local Runtime Data (Never commit local token history, logs, or private telemetry)
+.cato/
+cato-dashboard.html
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Claude Code local session files (do not commit session history)
+.claude/settings.json.cato-backup
+
+# Unit test & coverage artifacts
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.*
+!.env.example

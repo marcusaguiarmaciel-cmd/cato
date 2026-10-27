@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cato-claude"
+version = "0.1.0"
+description = "⚡ CATO (Claude Adaptive Token Optimizer) - Zero-dependency, cache-preserving token optimization toolkit for Claude Code CLI and Desktop"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Marcus Maciel", email = "marcus.aguiarmaciel@gmail.com"}
+]
+keywords = [
+    "claude-code",
+    "anthropic",
+    "token-optimization",
+    "context-engineering",
+    "ast-skeleton",
+    "prompt-caching",
+    "mcp-server",
+    "developer-tools",
+    "ai-agents"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent"
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+cato = "cato.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/marcusaguiarmaciel-cmd/cato"
+Repository = "https://github.com/marcusaguiarmaciel-cmd/cato.git"
+Issues = "https://github.com/marcusaguiarmaciel-cmd/cato/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "cato": {
+      "command": "C:/Users/user/AppData/Local/Microsoft/WindowsApps/PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0/python.exe",
+      "args": [
+        "C:/Users/user/Documents/antigravity/agitated-goodall/src/cato/cli.py",
+        "mcp-server"
+      ]
+    }
+  }
+}
