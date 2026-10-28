@@ -3,11 +3,14 @@ Handler do evento `UserPromptSubmit` do Claude Code — Guard de custo de contex
 
 Nos transcripts reais, o custo é dominado por releitura de contexto grande a cada turno e por
 reescritas de cache depois que o TTL expira. Antes do prompt ir para a API, este guard lê o fim
-do transcript e, uma única vez por situação, segura o prompt mostrando o custo concreto:
-1. Cache expirado (ocioso além do TTL) com contexto grande: continuar reescreve o contexto inteiro;
-2. Contexto acima de cada faixa (`CATO_CONTEXT_WARN`, padrão 250k/400k/600k): custo por turno.
-Reenviar o prompt segue normalmente (o aviso fica registrado em `guard_acks`). Comandos `/...`
-nunca são bloqueados. `CATO_GUARD=0` desliga. Qualquer erro deixa o prompt passar (fail-open).
+do transcript e:
+1. Cache expirado (ocioso além do TTL) com contexto grande: se reescrever o contexto custa pelo menos
+   `CATO_GUARD_BLOCK_USD` (padrão $1,00), segura o prompt UMA vez mostrando o custo; reenviar segue.
+   Abaixo disso, ou com `CATO_GUARD_BLOCK=0`, só avisa e o prompt segue.
+2. Contexto acima de cada faixa (`CATO_CONTEXT_WARN`, padrão 250k/400k/600k): só avisa, uma vez por faixa.
+Avisos usam `systemMessage` (aparecem para você, não entram no contexto do modelo). Comandos `/...` e
+`!...` nunca são tocados; depois de um `/compact` o guard espera a próxima chamada real antes de medir
+de novo. `CATO_GUARD=0` desliga tudo. Qualquer erro deixa o prompt passar (fail-open).
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from cato.telemetry.usage_report import last_turn_state
 
 IDLE_MIN_CONTEXT = 150_000
 DEFAULT_CONTEXT_BANDS = (250_000, 400_000, 600_000)
+DEFAULT_BLOCK_USD = 1.0
 # Tamanho típico do resumo gerado pelo /compact (tokens de saída)
 COMPACT_SUMMARY_TOKENS = 15_000
 
@@ -37,8 +41,14 @@ def _context_bands() -> List[int]:
     return bands or list(DEFAULT_CONTEXT_BANDS)
 
 
-def _block(reason: str) -> Dict[str, Any]:
-    return {"decision": "block", "reason": reason}
+def _block_threshold_usd() -> Optional[float]:
+    """Custo mínimo de reescrita para segurar o prompt; `None` quando bloquear está desligado."""
+    if os.environ.get("CATO_GUARD_BLOCK") == "0":
+        return None
+    try:
+        return float(os.environ.get("CATO_GUARD_BLOCK_USD") or DEFAULT_BLOCK_USD)
+    except ValueError:
+        return DEFAULT_BLOCK_USD
 
 
 def handle_user_prompt_submit(
@@ -55,7 +65,8 @@ def handle_user_prompt_submit(
     if not transcript:
         return None
     state = last_turn_state(str(transcript))
-    if not state or not state.get("timestamp"):
+    # Depois de um /compact o último `usage` é o do contexto antigo: espera a próxima chamada real
+    if not state or not state.get("timestamp") or state.get("compacted"):
         return None
 
     session_id = str(payload.get("session_id") or "default")
@@ -66,7 +77,7 @@ def handle_user_prompt_submit(
     ttl = int(state["ttl_seconds"])
     idle = now - float(state["timestamp"])
     per_turn = ctx * price.read / 1e6
-    compact_warm = per_turn + COMPACT_SUMMARY_TOKENS * price.output / 1e6
+    write_price = price.write_1h if ttl >= 3600 else price.write_5m
 
     # 1. Cache expirado: o próximo turno reescreve o contexto inteiro
     if idle > ttl and ctx >= IDLE_MIN_CONTEXT:
@@ -74,19 +85,32 @@ def handle_user_prompt_submit(
         if db_instance.has_guard_ack(session_id, ack_key):
             return None
         db_instance.add_guard_ack(session_id, ack_key)
-        write_price = price.write_1h if ttl >= 3600 else price.write_5m
         rewrite = ctx * write_price / 1e6
         compact_cold = ctx * price.write_5m / 1e6 + COMPACT_SUMMARY_TOKENS * price.output / 1e6
-        return _block(
-            f"[CATO] O cache desta conversa expirou ({int(idle // 60)} min parado; o cache dura {ttl // 60} min). "
-            f"Continuar agora reescreve {ctx:,} tokens de contexto ≈ ${rewrite:.2f}, e cada turno seguinte relê "
-            f"esse contexto (≈ ${per_turn:.3f}/turno).\n"
+        options = (
             f"• /clear ≈ $0 — recomeça limpo (melhor se a próxima tarefa é outra)\n"
-            f"• /compact ≈ ${compact_cold:.2f} uma vez — resume e o contexto cai para ~{COMPACT_SUMMARY_TOKENS // 1000}k\n"
-            f"• Reenvie o mesmo prompt para continuar assim mesmo."
+            f"• /compact ≈ ${compact_cold:.2f} uma vez — resume e o contexto cai para ~{COMPACT_SUMMARY_TOKENS // 1000}k"
         )
+        threshold = _block_threshold_usd()
+        if threshold is not None and rewrite >= threshold:
+            return {
+                "decision": "block",
+                "reason": (
+                    f"[CATO] Prompt segurado uma vez para evitar gasto: o cache desta conversa expirou "
+                    f"({int(idle // 60)} min parada; o cache dura {ttl // 60} min) e continuar agora reescreve "
+                    f"{ctx:,} tokens ≈ ${rewrite:.2f}.\n{options}\n"
+                    f"• Para continuar assim mesmo, envie o prompt de novo (não será segurado outra vez).\n"
+                    f"Ajustes: CATO_GUARD_BLOCK_USD (padrão $1.00) ou CATO_GUARD_BLOCK=0 para só avisar."
+                ),
+            }
+        return {
+            "systemMessage": (
+                f"[CATO] O cache expirou ({int(idle // 60)} min parada): este turno reescreve {ctx:,} tokens "
+                f"≈ ${rewrite:.2f}.\n{options}"
+            )
+        }
 
-    # 2. Contexto grande: cada turno relê tudo
+    # 2. Contexto grande: só avisa (cada turno relê tudo)
     crossed = [band for band in _context_bands() if ctx >= band]
     if crossed:
         band = crossed[-1]
@@ -94,14 +118,14 @@ def handle_user_prompt_submit(
         if db_instance.has_guard_ack(session_id, ack_key):
             return None
         db_instance.add_guard_ack(session_id, ack_key)
-        return _block(
-            f"[CATO] O contexto está em {ctx // 1000}k tokens. Cada turno relê tudo: ≈ ${per_turn:.3f}/turno "
-            f"(≈ ${per_turn * 100:.2f} a cada 100 turnos), e se a conversa ficar parada mais de {ttl // 60} min "
-            f"a reescrita custa ≈ ${ctx * (price.write_1h if ttl >= 3600 else price.write_5m) / 1e6:.2f}.\n"
-            f"• /compact ≈ ${compact_warm:.2f} uma vez — o contexto cai para ~{COMPACT_SUMMARY_TOKENS // 1000}k\n"
-            f"• /clear se a próxima tarefa é outra\n"
-            f"• Reenvie o mesmo prompt para continuar assim mesmo (próximo aviso só na faixa seguinte)."
-        )
+        compact_warm = per_turn + COMPACT_SUMMARY_TOKENS * price.output / 1e6
+        return {
+            "systemMessage": (
+                f"[CATO] Contexto em {ctx // 1000}k tokens: cada turno relê tudo (≈ ${per_turn:.3f}/turno, "
+                f"≈ ${per_turn * 100:.2f} a cada 100 turnos). /compact ≈ ${compact_warm:.2f} uma vez reduz para "
+                f"~{COMPACT_SUMMARY_TOKENS // 1000}k; /clear se a próxima tarefa é outra."
+            )
+        }
     return None
 
 

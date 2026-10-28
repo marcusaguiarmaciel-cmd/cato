@@ -22,9 +22,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from cato.bash_optimizer.parsers import ERROR_SIGNAL_RE
-from cato.bash_optimizer.runner import compress_and_record
+from cato.hooks.bash_permissions import is_rtk_command
 from cato.storage.db import CatoDB, estimate_tokens
-from cato.telemetry.usage_report import is_rtk_command
 
 MCP_VIRTUALIZATION_TOKEN_THRESHOLD = 1500
 
@@ -46,7 +45,7 @@ def compress_shell_output(
     tool_input: Dict[str, Any],
     tool_response: Any,
     session_id: str,
-    db: CatoDB,
+    db: Optional[CatoDB] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Comprime a saída REAL de `Bash`/`PowerShell` via `updatedToolOutput`, no mesmo formato
@@ -64,6 +63,8 @@ def compress_shell_output(
     stderr = str(tool_response.get("stderr") or "")
     if stderr.strip() and ERROR_SIGNAL_RE.search(stderr):
         return None
+    from cato.bash_optimizer.runner import compress_and_record  # import tardio: só quando há saída a avaliar
+
     final_text = compress_and_record(command, stdout, session_id, db, tool_name=tool_name)
     if final_text is None:
         return None
@@ -177,7 +178,6 @@ def handle_post_tool_use(
     tool_input = payload.get("tool_input") or {}
     tool_response = payload.get("tool_response")
     session_id = str(payload.get("session_id") or os.environ.get("CLAUDE_SESSION_ID", "default"))
-    db_instance = db or CatoDB()
 
     # =========================================================================
     # 1. VERIFICAÇÃO SINTÁTICA ZERO-TURN PÓS-EDIÇÃO (`Edit`, `Write`, `MultiEdit`)
@@ -199,7 +199,8 @@ def handle_post_tool_use(
     # 2. COMPRESSÃO DA SAÍDA REAL DE `Bash` / `PowerShell` (o que o RTK não tratou)
     # =========================================================================
     if tool_name in ("Bash", "PowerShell"):
-        return compress_shell_output(tool_name, tool_input, tool_response, session_id, db_instance)
+        # O banco só é aberto se houver o que comprimir (cada hook é um processo novo)
+        return compress_shell_output(tool_name, tool_input, tool_response, session_id, db)
 
     # =========================================================================
     # 3. VIRTUALIZAÇÃO SQLITE FTS5 PARA FERRAMENTAS MCP DE TEXTO (`mcp__.*`)
@@ -236,6 +237,7 @@ def handle_post_tool_use(
             )
             opt_tokens = estimate_tokens(summary_output)
 
+            db_instance = db or CatoDB()
             db_instance.store_sandbox_payload(
                 sandbox_id=sandbox_id,
                 session_id=session_id,

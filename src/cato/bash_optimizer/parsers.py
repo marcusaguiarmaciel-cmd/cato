@@ -1,7 +1,10 @@
 """
 Parsers determinísticos para compressão de saídas de terminal (Parte 2 do CATO).
-Reduz de 60% a 90% dos tokens de stdout/stderr preservando 100% dos sinais de falha,
-stack traces, números de linha e sumários finais.
+
+Só comprime categorias reconhecidamente ruidosas (testes, linters/compiladores, instalações e builds,
+logs de container) e nunca altera o conteúdo de saídas de dados arbitrárias (scripts, consultas,
+tabelas): nelas, cada linha pode ser a resposta que o modelo pediu. Linhas de falha, stack traces,
+números de linha e sumários finais são sempre preservados.
 """
 
 from __future__ import annotations
@@ -12,9 +15,16 @@ from typing import List, Tuple
 # Regex para códigos de escape ANSI (cores, cursores, formatação de terminal)
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
-# Regex para normalizar linhas de log repetitivas (timestamps, hex IDs, números grandes)
-LOG_TEMPLATE_RE = re.compile(
-    r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?|\b0x[0-9a-fA-F]+\b|\b\d{4,}\b)"
+# Barras de progresso visuais (blocos ou setas com percentual), nunca linhas de dados como `|---|---|`
+PROGRESS_BAR_RE = re.compile(r"^[\s█▓▒░#=>\-\[\]|]*[█▓▒░][\s█▓▒░#=>\-\[\]|]*(\d{1,3}(\.\d+)?%)?.{0,40}$")
+
+# Comandos cuja saída é ruído de processo (download, compilação, logs), onde cabeça + erros + cauda bastam
+NOISY_COMMAND_RE = re.compile(
+    r"\b(pip3?\s+install|uv\s+(pip|sync|add)|poetry\s+(install|add|update)|npm\s+(install|ci|i|run\s+build)"
+    r"|pnpm\s+(install|i|add|build)|yarn(\s+(install|add|build))?$|cargo\s+build|go\s+(build|mod\s+download)"
+    r"|docker(-compose)?\s+(compose\s+)?(build|pull|logs)|kubectl\s+logs|make\b|cmake\b|gradle|mvn\b"
+    r"|webpack|vite\s+build|next\s+build|apt(-get)?\s+install|brew\s+install|choco\s+install|winget\s+install)",
+    re.IGNORECASE,
 )
 
 # Palavras-chave de alto sinal que nunca devem ser omitidas silenciosamente
@@ -34,9 +44,8 @@ def strip_ansi_and_progress(text: str) -> str:
             # Mantém apenas o último segmento após \r (como um terminal real exibe)
             segments = [seg for seg in raw_line.split("\r") if seg.strip()]
             raw_line = segments[-1] if segments else ""
-        # Ignora linhas que são puramente barras de progresso visuais
-        stripped = raw_line.strip()
-        if stripped and all(c in "█▓▒░=#>-|/.\\ " for c in stripped) and len(stripped) > 5:
+        # Ignora só barras de progresso visuais (com caracteres de bloco), nunca separadores de tabela
+        if PROGRESS_BAR_RE.match(raw_line.strip()) and raw_line.strip():
             continue
         lines.append(raw_line.rstrip())
     return "\n".join(lines)
@@ -78,12 +87,16 @@ def compress_test_output(command: str, text: str) -> Tuple[str, bool]:
         if not in_failure_section:
             if (
                 re.search(r"::.*?\s+PASSED(?:\s+\[\s*\d+%\])?$", stripped)
-                or re.match(r"^(✓|✔|PASS|\.)\s+", stripped)
+                or re.match(r"^(✓|✔|PASS)\s+", stripped)
+                or re.match(r"^\S+\s+\(\S+\)\s+\.\.\.\s+ok$", stripped)
                 or re.match(r"^test\s+\S+\s+\.\.\.\s+ok$", stripped)
                 or re.match(r"^ok\s+\S+\s+[\d\.]+s$", stripped)
-                or re.match(r"^[\.sFEx]+(\s+\[\s*\d+%\])?$", stripped)
             ):
                 passed_count += 1
+                omitted_lines += 1
+                continue
+            # Linhas de progresso só com testes aprovados/pulados (".....ss..."); com F/E ficam
+            if re.match(r"^[\.s]+(\s+\[\s*\d+%\])?$", stripped):
                 omitted_lines += 1
                 continue
 
@@ -106,7 +119,10 @@ def compress_test_output(command: str, text: str) -> Tuple[str, bool]:
     if omitted_lines < 5:
         return text, False
 
-    header = f"[CATO Test Filter: {passed_count} testes aprovados e {omitted_lines} linhas de ruído suprimidas]"
+    header = (
+        f"[CATO Test Filter: {passed_count} linhas de teste aprovado e "
+        f"{omitted_lines - passed_count} linhas de progresso/banner suprimidas]"
+    )
     result = header + "\n" + "\n".join(kept_lines)
     # Se o bloco de falhas ainda for gigantesco (>200 linhas), aplica truncamento inteligente
     if len(kept_lines) > 200:
@@ -129,9 +145,9 @@ def compress_linter_or_compiler_output(command: str, text: str) -> Tuple[str, bo
 
     for line in lines:
         # Tenta identificar código de erro (ex: TS2322, E501, F401, [no-unused-vars])
-        match = re.search(r"\b(TS\d{4}|[EFW]\d{3,4}|\[[\w\-/@]+\])\b", line)
+        match = re.search(r"\b(TS\d{4}|[EFW]\d{3,4})\b|(\[[\w\-/@]+\])", line)
         if match:
-            rule_code = match.group(1)
+            rule_code = match.group(1) or match.group(2)
             rule_counts[rule_code] = rule_counts.get(rule_code, 0) + 1
             # Mantém as primeiras 10 ocorrências de cada código de erro para contexto cirúrgico
             if rule_counts[rule_code] > 10:
@@ -153,21 +169,22 @@ def compress_linter_or_compiler_output(command: str, text: str) -> Tuple[str, bo
 
 
 def compress_git_output(command: str, text: str) -> Tuple[str, bool]:
-    """Comprime saídas extensas de comandos git (status, diff, log)."""
+    """
+    Em `git diff`/`git show`, omite apenas diffs de lockfiles e bundles minificados. Mudanças de código
+    nunca são cortadas (o modelo pode estar revisando exatamente aquele trecho); demais saídas do git
+    passam intactas.
+    """
     lines = text.splitlines()
     if len(lines) <= 80:
         return text, False
 
-    # Para git diff: oculta diffs de lockfiles e limita arquivos individuais enormes
-    if "diff" in command:
+    if re.search(r"\bgit\s+(diff|show)\b", command):
         kept: List[str] = []
         skip_current_file = False
-        current_file_lines = 0
         omitted_lines = 0
 
         for line in lines:
             if line.startswith("diff --git "):
-                current_file_lines = 0
                 if any(
                     lock in line
                     for lock in (
@@ -191,28 +208,19 @@ def compress_git_output(command: str, text: str) -> Tuple[str, bool]:
             if skip_current_file:
                 omitted_lines += 1
                 continue
-
-            current_file_lines += 1
-            if current_file_lines == 121:
-                kept.append("  [... CATO: Diff deste arquivo truncado após 120 linhas ...]")
-                omitted_lines += 1
-                continue
-            elif current_file_lines > 121:
-                omitted_lines += 1
-                continue
-
             kept.append(line)
 
         if omitted_lines > 0:
-            kept.append(f"\n[CATO Git Diff Filter: {omitted_lines} linhas de diff secundárias omitidas]")
+            kept.append(f"\n[CATO Git Diff Filter: {omitted_lines} linhas de lockfiles/bundles omitidas]")
             return "\n".join(kept), True
 
-    return compress_generic_output(text, max_lines=100)
+    return text, False
 
 
 def deduplicate_repetitive_logs(lines: List[str]) -> Tuple[List[str], int]:
     """
-    Detecta e colapsa linhas de log repetitivas consecutivas ou quase-idênticas (estilo logzip).
+    Colapsa linhas consecutivas EXATAMENTE iguais. Linhas que diferem em qualquer caractere (inclusive
+    só nos números) são dados distintos e ficam todas.
     """
     if not lines:
         return [], 0
@@ -223,19 +231,19 @@ def deduplicate_repetitive_logs(lines: List[str]) -> Tuple[List[str], int]:
     total_collapsed = 0
 
     for line in lines:
-        template = LOG_TEMPLATE_RE.sub("<NUM>", line.strip())
+        template = line.strip()
         if template and template == prev_template and len(template) > 10:
             repeat_count += 1
             total_collapsed += 1
         else:
             if repeat_count > 0:
-                result.append(f"  ... [linha padrão acima repetida mais {repeat_count}x] ...")
+                result.append(f"  ... [linha acima repetida, idêntica, mais {repeat_count}x] ...")
                 repeat_count = 0
             result.append(line)
             prev_template = template
 
     if repeat_count > 0:
-        result.append(f"  ... [linha padrão acima repetida mais {repeat_count}x] ...")
+        result.append(f"  ... [linha acima repetida, idêntica, mais {repeat_count}x] ...")
 
     return result, total_collapsed
 
@@ -311,15 +319,20 @@ def optimize_command_output(command: str, raw_output: str) -> Tuple[str, bool, s
         if changed or ansi_removed:
             return compressed, True, "linter_compiler_parser"
 
-    # 3. Comandos Git
+    # 3. Comandos Git (só lockfiles/bundles em diffs)
     if cmd_lower.startswith("git ") or " git " in cmd_lower:
         compressed, changed = compress_git_output(command, cleaned)
         if changed or ansi_removed:
             return compressed, True, "git_parser"
+        return cleaned, False, "passthrough"
 
-    # 4. Fallback genérico para qualquer comando verboso
-    compressed, changed = compress_generic_output(cleaned, max_lines=120)
-    if changed or ansi_removed:
-        return compressed, True, "generic_log_compressor"
+    # 4. Instalações, builds e logs: cabeça + erros + cauda
+    if NOISY_COMMAND_RE.search(command):
+        compressed, changed = compress_generic_output(cleaned, max_lines=120)
+        if changed or ansi_removed:
+            return compressed, True, "build_log_compressor"
 
+    # 5. Qualquer outra saída é dado: só remove códigos ANSI/barras de progresso, nunca linhas de conteúdo
+    if ansi_removed:
+        return cleaned, True, "ansi_strip"
     return cleaned, False, "passthrough"

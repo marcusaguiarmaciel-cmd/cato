@@ -16,7 +16,6 @@ import base64
 import json
 import os
 import re
-import shlex
 import struct
 import time
 from collections import Counter, defaultdict
@@ -24,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
+from cato.hooks.bash_permissions import is_rtk_command
 from cato.telemetry.pricing import usage_cost
 
 # Uma escrita de cache acima disso numa única chamada é uma reescrita do prefixo (cache miss)
@@ -60,14 +60,6 @@ def context_tokens(usage: Dict[str, Any]) -> int:
         + (usage.get("cache_creation_input_tokens") or 0)
         + (usage.get("cache_read_input_tokens") or 0)
     )
-
-
-def is_rtk_command(command: str) -> bool:
-    try:
-        first = shlex.split(command.strip(), posix=True)[0]
-    except Exception:
-        first = command.strip().split(" ", 1)[0] if command.strip() else ""
-    return Path(first.replace("\\", "/")).name.lower() in ("rtk", "rtk.exe")
 
 
 def image_tokens(b64_data: str) -> int:
@@ -139,8 +131,10 @@ def code_read_key(tool: str, tool_input: Dict[str, Any]) -> Optional[Tuple[str, 
 def last_turn_state(transcript_path: str, tail_bytes: int = 4_000_000) -> Optional[Dict[str, Any]]:
     """
     Lê só o final do transcript e devolve o estado da última chamada de API real:
-    `{timestamp, model, context, ttl_seconds, usage}`. O TTL vem do último `usage` que gravou cache
-    (1h se houve `ephemeral_1h`, 5 min se só `ephemeral_5m`; 1h se não houver evidência).
+    `{timestamp, model, context, ttl_seconds, usage, compacted}`. O TTL vem do último `usage` que gravou
+    cache (1h se houve `ephemeral_1h`, 5 min se só `ephemeral_5m`; 1h se não houver evidência).
+    `compacted=True` quando houve `/compact` depois dessa chamada: o `context` é o de antes da
+    compactação e não vale mais (os prompts seguintes chegam antes de qualquer chamada nova).
     """
     path = Path(transcript_path)
     try:
@@ -152,7 +146,11 @@ def last_turn_state(transcript_path: str, tail_bytes: int = 4_000_000) -> Option
         return None
 
     state: Optional[Dict[str, Any]] = None
+    compacted_after = False
     for line in reversed(lines):
+        if state is None and '"compact_boundary"' in line:
+            compacted_after = True
+            continue
         if '"usage"' not in line:
             continue
         try:
@@ -170,6 +168,7 @@ def last_turn_state(transcript_path: str, tail_bytes: int = 4_000_000) -> Option
                 "context": context_tokens(usage),
                 "ttl_seconds": None,
                 "usage": usage,
+                "compacted": compacted_after,
             }
         creation = usage.get("cache_creation") or {}
         if creation.get("ephemeral_1h_input_tokens"):

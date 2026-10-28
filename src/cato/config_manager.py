@@ -11,6 +11,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from cato.hooks.bash_permissions import rtk_hook_installed
 from cato.hooks.pre_tool_use import get_cato_executable_cmd
 
 DEFAULT_DENY_RULES = [
@@ -108,7 +109,44 @@ def _ensure_hook_entry(
     return new_list
 
 
-def build_merged_settings(existing: Dict[str, Any]) -> Dict[str, Any]:
+# Comandos cuja saída o CATO sabe comprimir sem perder informação (testes, linters, instalações, builds,
+# logs). Viram filtros `if` dos hooks: qualquer outro comando nem inicia o Python.
+COMPRESSIBLE_BASH_RULES = (
+    "pytest*", "python -m pytest*", "python3 -m pytest*", "py.test*", "python -m unittest*", "python3 -m unittest*",
+    "npm test*", "npm run test*", "pnpm test*", "yarn test*", "npx jest*", "jest*", "npx vitest*", "vitest*",
+    "cargo test*", "go test*",
+    "tsc*", "npx tsc*", "eslint*", "npx eslint*", "ruff*", "flake8*", "mypy*", "pyright*",
+    "cargo clippy*", "cargo check*",
+    "pip install*", "pip3 install*", "python -m pip install*", "uv pip*", "uv sync*", "poetry install*",
+    "npm install*", "npm ci*", "npm run build*", "pnpm install*", "pnpm build*", "yarn install*", "yarn build*",
+    "cargo build*", "go build*", "make*", "gradle*", "./gradlew*", "mvn*",
+    "docker build*", "docker compose build*", "docker logs*", "docker compose logs*", "kubectl logs*",
+)
+# A checagem de sintaxe pós-edição só existe para Python e JSON
+SYNTAX_CHECK_GLOBS = ("**/*.py", "**/*.json")
+
+
+def _remove_cato_hook_entries(hooks_list: List[Dict[str, Any]], marker: str = "cato") -> List[Dict[str, Any]]:
+    """Remove as entradas do CATO de um evento, preservando os hooks do usuário."""
+    return [
+        item
+        for item in hooks_list
+        if not any(marker in str(h.get("command", "")).lower() for h in item.get("hooks", []))
+    ]
+
+
+def _has_rtk_hook(settings: Dict[str, Any]) -> bool:
+    for item in (settings.get("hooks") or {}).get("PreToolUse") or []:
+        if any("rtk hook" in str(h.get("command", "")).lower() for h in item.get("hooks", [])):
+            return True
+    return False
+
+
+def build_merged_settings(
+    existing: Dict[str, Any],
+    read_guard: bool = False,
+    rtk_installed: Optional[bool] = None,
+) -> Dict[str, Any]:
     """Faz o merge seguro das configurações de otimização do CATO em um dicionário `settings.json`."""
     merged = json.loads(json.dumps(existing)) if existing else {}
 
@@ -131,24 +169,38 @@ def build_merged_settings(existing: Dict[str, Any]) -> Dict[str, Any]:
     perms["deny"] = deny_list
 
     # 4. Hooks `PreToolUse`, `PostToolUse`, `PreCompact` e `SessionStart`
-    cato_cmd = get_cato_executable_cmd()
-    pre_cmd = f"{cato_cmd} hook pre-tool-use"
-    post_cmd = f"{cato_cmd} hook post-tool-use"
-    compact_cmd = f"{cato_cmd} hook pre-compact"
-    session_cmd = f"{cato_cmd} hook session-reset"
-    prompt_cmd = f"{cato_cmd} hook user-prompt-submit"
+    # Hooks usam o ponto de entrada mínimo (`hook_runner.py`): cada um é um processo novo por chamada
+    hook_cmd = get_cato_executable_cmd("hook_runner.py")
+    pre_cmd = f"{hook_cmd} pre-tool-use"
+    post_cmd = f"{hook_cmd} post-tool-use"
+    compact_cmd = f"{hook_cmd} pre-compact"
+    session_cmd = f"{hook_cmd} session-reset"
+    prompt_cmd = f"{hook_cmd} user-prompt-submit"
 
     hooks_root = merged.setdefault("hooks", {})
-    hooks_root["PreToolUse"] = _ensure_hook_entry(
-        list(hooks_root.get("PreToolUse", [])),
-        matcher="Read|Bash",
-        command=pre_cmd,
-    )
-    hooks_root["PostToolUse"] = _ensure_hook_entry(
-        list(hooks_root.get("PostToolUse", [])),
-        matcher="Edit|Write|MultiEdit|Bash|PowerShell|mcp__.*",
-        command=post_cmd,
-    )
+    # PreToolUse só quando tem trabalho: `Read` com o Read guard (opt-in) e `Bash` quando o RTK não tem
+    # hook próprio (aí o CATO delega a ele). Hook registrado sem uso custaria ~0,3 s por chamada.
+    rtk_present = _has_rtk_hook(merged) if rtk_installed is None else rtk_installed
+    pre_matchers = (["Read"] if read_guard else []) + ([] if rtk_present else ["Bash"])
+    pre_list = list(hooks_root.get("PreToolUse", []))
+    if pre_matchers:
+        hooks_root["PreToolUse"] = _ensure_hook_entry(pre_list, matcher="|".join(pre_matchers), command=pre_cmd)
+    else:
+        hooks_root["PreToolUse"] = _remove_cato_hook_entries(pre_list)
+    # PostToolUse com filtro `if`: o Claude Code só inicia o Python quando o comando/arquivo casa.
+    # Sem isso, cada Bash pagaria ~0,4-0,5 s de partida do Python mesmo quando não há nada a comprimir.
+    post_entries: List[Dict[str, Any]] = [
+        {
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "if": f"Bash({rule})", "command": post_cmd} for rule in COMPRESSIBLE_BASH_RULES],
+        },
+        {
+            "matcher": "Edit|Write|MultiEdit",
+            "hooks": [{"type": "command", "if": f"Edit({glob})", "command": post_cmd} for glob in SYNTAX_CHECK_GLOBS],
+        },
+        {"matcher": "mcp__.*", "hooks": [{"type": "command", "command": post_cmd}]},
+    ]
+    hooks_root["PostToolUse"] = _remove_cato_hook_entries(list(hooks_root.get("PostToolUse", []))) + post_entries
     hooks_root["UserPromptSubmit"] = _ensure_hook_entry(
         list(hooks_root.get("UserPromptSubmit", [])),
         matcher=None,
@@ -172,6 +224,7 @@ def install_cato(
     target_root: Path,
     is_global: bool = False,
     dry_run: bool = False,
+    read_guard: bool = False,
 ) -> Dict[str, Any]:
     """
     Instala o CATO em `target_root/.claude` (ou diretamente em `~/.claude` se `is_global=True`).
@@ -189,7 +242,9 @@ def install_cato(
         except Exception:
             existing_settings = {}
 
-    merged_settings = build_merged_settings(existing_settings)
+    # O hook do RTK pode estar em outro escopo (ex.: global) mesmo numa instalação por projeto
+    rtk_installed = _has_rtk_hook(existing_settings) or rtk_hook_installed(None if is_global else str(target_root))
+    merged_settings = build_merged_settings(existing_settings, read_guard=read_guard, rtk_installed=rtk_installed)
     actions: List[str] = []
 
     if not dry_run:
@@ -308,14 +363,20 @@ def audit_environment(project_root: Path) -> Tuple[int, List[Dict[str, str]]]:
         for entry in hooks
         for h in entry.get("hooks", [])
     ]
-    has_cato_hook = any("cato" in c.lower() for c in hook_cmds)
-    has_rtk_hook = any("rtk" in c.lower() for c in hook_cmds)
+    all_hook_cmds = [
+        str(h.get("command", ""))
+        for entries in (combined_settings.get("hooks") or {}).values()
+        for entry in entries
+        for h in entry.get("hooks", [])
+    ]
+    has_cato_hook = any("cato" in c.lower() for c in all_hook_cmds)
+    has_rtk_hook = any("rtk hook" in c.lower() for c in hook_cmds)
 
     prompt_hooks = combined_settings.get("hooks", {}).get("UserPromptSubmit", [])
     has_guard = any("cato" in str(h.get("command", "")).lower() for e in prompt_hooks for h in e.get("hooks", []))
 
     if has_cato_hook:
-        findings.append({"level": "OK", "msg": "Hook CATO PreToolUse ativo (delegação ao RTK com gate de permissões)."})
+        findings.append({"level": "OK", "msg": "Hooks do CATO ativos (compressão em PostToolUse, guard, pós-compactação)."})
     else:
         score -= 25
         findings.append(

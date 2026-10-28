@@ -233,6 +233,31 @@ class CatoDB:
                 (session_id, ack_key, time.time()),
             )
 
+    def prune(self, older_than_days: float = 14.0) -> Dict[str, int]:
+        """
+        Apaga dados de trabalho antigos (logs brutos, payloads de sandbox, leituras e avisos de sessão).
+        A telemetria fica: é o histórico que o usuário consulta.
+        """
+        cutoff = time.time() - older_than_days * 86400
+        removed: Dict[str, int] = {}
+        with self._connect() as conn:
+            old_sbx = [r[0] for r in conn.execute("SELECT sandbox_id FROM sandbox_meta WHERE timestamp < ?", (cutoff,))]
+            for sbx in old_sbx:
+                conn.execute("DELETE FROM sandbox_chunks WHERE sandbox_id = ?", (sbx,))
+            removed["sandboxes"] = conn.execute("DELETE FROM sandbox_meta WHERE timestamp < ?", (cutoff,)).rowcount
+            removed["command_logs"] = conn.execute("DELETE FROM command_logs WHERE timestamp < ?", (cutoff,)).rowcount
+            removed["session_reads"] = conn.execute("DELETE FROM session_reads WHERE last_read_at < ?", (cutoff,)).rowcount
+            removed["guard_acks"] = conn.execute("DELETE FROM guard_acks WHERE timestamp < ?", (cutoff,)).rowcount
+        removed["log_files"] = 0
+        for log_file in get_logs_dir().glob("*.log"):
+            try:
+                if log_file.stat().st_mtime < cutoff:
+                    log_file.unlink()
+                    removed["log_files"] += 1
+            except OSError:
+                continue
+        return removed
+
     def clear_guard_acks(self, session_id: str) -> int:
         """Após /compact ou /clear o contexto encolhe: os avisos do guard voltam a valer."""
         with self._connect() as conn:
@@ -312,7 +337,7 @@ class CatoDB:
 
         with self._connect() as conn:
             # Preserva identificadores com underscore (ex: module_42) ao montar os termos FTS5
-            safe_terms = [w for w in re.findall(r"[A-Za-z0-9_]+", query) if len(w) >= 2]
+            safe_terms = [w for w in re.findall(r"\w+", query) if len(w) >= 2]  # \w inclui acentos (ação)
             fts_query = " OR ".join(f'"{t}"' for t in safe_terms) if safe_terms else ""
             if fts_query:
                 try:

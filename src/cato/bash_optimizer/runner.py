@@ -88,7 +88,7 @@ def compress_and_record(
     command: str,
     output: str,
     session_id: str,
-    db: CatoDB,
+    db: Optional[CatoDB],
     exit_code: int = 0,
     tool_name: str = "Bash",
 ) -> Optional[str]:
@@ -106,6 +106,7 @@ def compress_and_record(
     if not was_modified or (raw_tokens - optimized_tokens < 80 and optimized_tokens > int(raw_tokens * 0.85)):
         return None
 
+    db = db or CatoDB()
     log_hash = hashlib.sha256(f"{time.time()}:{command}".encode("utf-8")).hexdigest()[:8]
     log_id = f"cmd_{log_hash}"
     log_file: Path = get_logs_dir() / f"{log_id}.log"

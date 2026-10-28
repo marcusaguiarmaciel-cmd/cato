@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -40,6 +41,15 @@ def _settings_paths(cwd: Optional[str]) -> List[Path]:
         paths.append(claude_dir / "settings.local.json")
     paths.extend(_managed_settings_paths())
     return paths
+
+
+def is_rtk_command(command: str) -> bool:
+    """Indica se o comando já foi reescrito para o RTK (`rtk ...` ou caminho absoluto do `rtk.exe`)."""
+    try:
+        first = shlex.split(command.strip(), posix=True)[0]
+    except Exception:
+        first = command.strip().split(" ", 1)[0] if command.strip() else ""
+    return Path(first.replace("\\", "/")).name.lower() in ("rtk", "rtk.exe")
 
 
 def rtk_hook_installed(cwd: Optional[str] = None) -> bool:

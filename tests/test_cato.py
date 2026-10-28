@@ -84,12 +84,24 @@ class TestCatoSystem(unittest.TestCase):
         self.assertEqual(merged["env"]["CLAUDE_CODE_FORK_SUBAGENT"], "0")
         self.assertIn("Read(./node_modules/**)", merged["permissions"]["deny"])
 
+        # Com o hook do RTK presente, o CATO não registra PreToolUse (não teria trabalho, só latência)
         pre_hooks = merged["hooks"]["PreToolUse"]
-        self.assertEqual(len(pre_hooks), 2)
+        self.assertEqual(pre_hooks, existing["hooks"]["PreToolUse"])
+        # Hooks usam o ponto de entrada mínimo e filtros `if`: Python só inicia para comandos comprimíveis
+        bash_post = next(e for e in merged["hooks"]["PostToolUse"] if e["matcher"] == "Bash")
+        self.assertTrue(all("hook_runner.py" in h["command"] and h["if"].startswith("Bash(") for h in bash_post["hooks"]))
+        self.assertIn("Bash(pytest*)", [h["if"] for h in bash_post["hooks"]])
+        self.assertNotIn("Bash(sed*)", [h["if"] for h in bash_post["hooks"]])
+        edit_post = next(e for e in merged["hooks"]["PostToolUse"] if e["matcher"] == "Edit|Write|MultiEdit")
+        self.assertEqual({h["if"] for h in edit_post["hooks"]}, {"Edit(**/*.py)", "Edit(**/*.json)"})
 
-        # Rodar build_merged_settings uma segunda vez deve ser 100% idempotente (não duplicar o hook CATO)
+        # Rodar build_merged_settings uma segunda vez deve ser 100% idempotente (não duplicar hooks do CATO)
         merged_twice = build_merged_settings(merged)
-        self.assertEqual(len(merged_twice["hooks"]["PreToolUse"]), 2)
+        self.assertEqual(merged_twice["hooks"], merged["hooks"])
+
+        # Sem RTK, o CATO registra PreToolUse para delegar Bash; com --read-guard inclui Read
+        no_rtk = build_merged_settings({}, read_guard=True)
+        self.assertEqual([e["matcher"] for e in no_rtk["hooks"]["PreToolUse"]], ["Read|Bash"])
 
     def test_part1_install_creates_agents_and_rules(self) -> None:
         project_dir = self.root / "my_project"
@@ -144,6 +156,32 @@ class TestCatoSystem(unittest.TestCase):
         comp_diff, mod_diff = compress_git_output("git diff", "\n".join(diff_lines))
         self.assertTrue(mod_diff)
         self.assertIn("lockfile/bundle minificado omitido", comp_diff)
+
+        # Diff de código nunca é cortado (o modelo pode estar revisando exatamente aquele trecho)
+        code_diff = "\n".join(["diff --git a/app.py b/app.py"] + [f"+    total += {i}" for i in range(300)])
+        self.assertEqual(compress_git_output("git diff", code_diff), (code_diff, False))
+
+        # Regra de linter entre colchetes ([no-unused-vars]) agora é reconhecida
+        eslint = "\n".join(f"  {i}:5  error  'x{i}' is defined but never used  [no-unused-vars]" for i in range(60))
+        comp_eslint, _ = compress_linter_or_compiler_output("eslint .", eslint)
+        self.assertIn("[no-unused-vars]: 60x", comp_eslint)
+
+    def test_part2_never_destroys_data_from_arbitrary_commands(self) -> None:
+        # Regressão: linhas que só diferem nos números eram colapsadas como "repetidas" (dados perdidos)
+        rows = "\n".join(f"projeto-{i % 2} | ctx antes: {880_000 + i * 7_919} | depois: summary > prompt" for i in range(200))
+        for command in ("python analisa.py", "node -e 'x'", "curl https://api/x", "git log --oneline"):
+            out, modified, strategy = optimize_command_output(command, rows)
+            self.assertFalse(modified, command)
+            self.assertEqual(out, rows)
+        # Separadores de tabela Markdown não são barras de progresso
+        table = "| a | b |\n|---|---|\n| 1 | 2 |"
+        self.assertEqual(strip_ansi_and_progress(table), table)
+        # Só linhas EXATAMENTE iguais colapsam, e só em comandos de build/log
+        log = "\n".join(["Downloading wheel dependency-pack (12.4 MB) ..."] * 150 + ["Successfully installed pkg"])
+        out, modified, strategy = optimize_command_output("pip install -r requirements.txt", log)
+        self.assertTrue(modified)
+        self.assertEqual(strategy, "build_log_compressor")
+        self.assertIn("Successfully installed pkg", out)
 
     # =========================================================================
     # TESTES DA PARTE 3: AST Skeletonizer, Deduplicação SHA-256 & Circuit Breaker
@@ -413,10 +451,31 @@ class TestCatoSystem(unittest.TestCase):
         self.assertIsNone(run("continua", 121))  # reenvio passa
         self.assertIsNone(run("/compact", 120, session="outra"))  # comandos nunca são bloqueados
 
-        # Cache quente com contexto > 250k: aviso de faixa, uma vez
+        # Cache quente com contexto > 250k: só AVISA (systemMessage), nunca segura o prompt; uma vez por faixa
         resp = run("próximo passo", 5, session="sess_band")
-        self.assertIn("300k", resp["reason"])
+        self.assertNotIn("decision", resp)
+        self.assertIn("300k", resp["systemMessage"])
         self.assertIsNone(run("próximo passo", 6, session="sess_band"))
+
+        # Reescrita abaixo do limite de bloqueio, ou bloqueio desligado: só avisa
+        with mock.patch.dict(os.environ, {"CATO_GUARD_BLOCK_USD": "5"}):
+            resp = run("continua", 120, session="sess_cheap")
+            self.assertNotIn("decision", resp)
+            self.assertIn("expirou", resp["systemMessage"])
+        with mock.patch.dict(os.environ, {"CATO_GUARD_BLOCK": "0"}):
+            self.assertNotIn("decision", run("continua", 120, session="sess_noblock"))
+
+        # Logo depois de um /compact o último usage é o contexto antigo: o guard não age
+        compacted = self._write_transcript(
+            "compacted",
+            [
+                self._assistant("c1", "2026-10-20T10:00:00Z", "claude-opus-5-5", read=880_000, write_1h=10_000),
+                {"type": "system", "subtype": "compact_boundary", "timestamp": "2026-10-20T10:01:00Z"},
+                {"type": "user", "isCompactSummary": True, "message": {"content": "resumo"}},
+            ],
+        )
+        payload = {"session_id": "sess_compacted", "transcript_path": str(compacted), "prompt": "oi"}
+        self.assertIsNone(handle_user_prompt_submit(payload, db=self.db, now=last + 3 * 3600))
 
         # Após /compact (SessionStart) os avisos voltam a valer
         handle_session_reset({"session_id": "sess_band", "source": "compact"}, db=self.db)
@@ -467,6 +526,39 @@ class TestCatoSystem(unittest.TestCase):
         self.assertIn("cato_read_symbol", tool_names)
         self.assertIn("cato_search_sandbox", tool_names)
         self.assertIn("cato_token_savings", tool_names)
+
+        init = handle_mcp_jsonrpc_message({"id": 2, "method": "initialize", "params": {"protocolVersion": "1999-01-01"}})
+        self.assertEqual(init["result"]["protocolVersion"], "2025-06-18")  # não ecoa versão desconhecida
+
+        # As ferramentas MCP respeitam o projeto, arquivos sensíveis e as regras `deny` de Read
+        project = self.root / "proj"
+        (project / ".claude").mkdir(parents=True)
+        (project / "app.js").write_text(
+            "const total = calculateTotal(items);\n\nfunction calculateTotal(items) {\n  return items.length;\n}\n",
+            encoding="utf-8",
+        )
+        (project / ".env").write_text("TOKEN=segredo", encoding="utf-8")
+        (project / "vendor").mkdir()
+        (project / "vendor" / "lib.js").write_text("function x() {}\n", encoding="utf-8")
+        (project / ".claude" / "settings.json").write_text(
+            json.dumps({"permissions": {"deny": ["Read(./vendor/**)"]}}), encoding="utf-8"
+        )
+        outside = self.root / "fora.js"
+        outside.write_text("function y() {}\n", encoding="utf-8")
+
+        def call(name: str, args: dict) -> dict:
+            msg = {"id": 3, "method": "tools/call", "params": {"name": name, "arguments": args}}
+            return handle_mcp_jsonrpc_message(msg, db=self.db)["result"]
+
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(project)}):
+            ok = call("cato_read_symbol", {"file_path": "app.js", "symbol_name": "calculateTotal"})
+            self.assertFalse(ok["isError"])
+            self.assertIn("3: function calculateTotal(items) {", ok["content"][0]["text"])  # definição, não o uso
+            for path in (".env", "vendor/lib.js", str(outside)):
+                res = call("cato_read_symbol", {"file_path": path, "symbol_name": "x"})
+                self.assertTrue(res["isError"], path)
+            bad_id = call("cato_search_sandbox", {"id": "../../segredo", "query": "x"})
+            self.assertTrue(bad_id["isError"])
 
     # =========================================================================
     # TESTES DA PARTE 5: PostToolUse (Syntax Check + Virtualização FTS5 MCP)

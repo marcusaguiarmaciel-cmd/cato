@@ -10,13 +10,57 @@ Expõe 4 ferramentas de alta eficiência de tokens ao Claude Code:
 
 from __future__ import annotations
 
+import fnmatch
 import json
+import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from cato import __version__
 from cato.code_intel.repomap import build_repository_map, extract_symbol_source
-from cato.storage.db import CatoDB, estimate_tokens, get_logs_dir
+from cato.hooks.bash_permissions import _settings_paths
+from cato.storage.db import CatoDB, get_logs_dir
+
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+SANDBOX_ID_RE = re.compile(r"^(sbx|cmd)_[0-9a-f]{8}$")
+# Arquivos que nunca saem por uma ferramenta do CATO, mesmo sem regra `deny` configurada
+SENSITIVE_FILE_PATTERNS = (".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*", "*credentials*", "*secret*")
+
+
+def _project_root() -> Path:
+    return Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()).resolve()
+
+
+def check_readable_path(file_path: str) -> Path:
+    """
+    Valida um caminho pedido pelo modelo antes de ler: precisa estar dentro do projeto, não pode ser
+    um arquivo sensível e não pode casar com uma regra `deny` de `Read(...)` dos settings do usuário
+    (uma ferramenta MCP não passa pelas regras de permissão do `Read` nativo).
+    """
+    root = _project_root()
+    path = Path(file_path)
+    path = (path if path.is_absolute() else root / path).resolve()
+    if root != path and root not in path.parents:
+        raise PermissionError(f"{file_path} está fora do projeto ({root})")
+    if any(fnmatch.fnmatch(path.name.lower(), pat) for pat in SENSITIVE_FILE_PATTERNS):
+        raise PermissionError(f"{path.name} parece conter segredos e não é lido pelo CATO")
+    rel = path.relative_to(root).as_posix()
+    for settings_path in _settings_paths(str(root)):
+        try:
+            data = json.loads(settings_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for rule in (data.get("permissions") or {}).get("deny", []):
+            rule = str(rule).strip()
+            if not (rule.startswith("Read(") and rule.endswith(")")):
+                continue
+            pattern = rule[5:-1].strip()
+            pattern = pattern[2:] if pattern.startswith("./") else pattern.lstrip("/")
+            if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(rel, pattern.rstrip("*").rstrip("/") + "/*"):
+                raise PermissionError(f"{rel} é bloqueado pela regra {rule} em {settings_path}")
+    return path
 
 MCP_TOOLS_SCHEMA: List[Dict[str, Any]] = [
     {
@@ -109,43 +153,26 @@ def execute_mcp_tool(
             root_dir = str(arguments.get("root_dir") or ".")
             focus = arguments.get("focus_query")
             budget = int(arguments.get("token_budget") or 1200)
-            repo_map = build_repository_map(root_dir=root_dir, focus_query=focus, token_budget=budget)
-            opt_tok = estimate_tokens(repo_map)
-            # Compara com o custo médio de ler os arquivos exploratoriamente (~4x o mapa)
-            db_instance.record_telemetry(
-                session_id="mcp",
-                event_type="mcp_repo_map",
-                tool_name="cato_repo_map",
-                target=f"{root_dir} ({focus or 'all'})",
-                raw_tokens=opt_tok * 4,
-                optimized_tokens=opt_tok,
-            )
+            # Sem telemetria de "economia": não há como medir o que o modelo leria sem o mapa
+            root = check_readable_path(root_dir)
+            repo_map = build_repository_map(root_dir=root, focus_query=focus, token_budget=budget)
             return {"content": [{"type": "text", "text": repo_map}], "isError": False}
 
         if name == "cato_read_symbol":
-            file_path = str(arguments["file_path"])
+            file_path = check_readable_path(str(arguments["file_path"]))
             symbol_name = str(arguments["symbol_name"])
-            full_text = Path(file_path).read_text(encoding="utf-8", errors="replace")
-            raw_tok = estimate_tokens(full_text)
-
             snippet, s_line, e_line = extract_symbol_source(file_path, symbol_name)
             header = f"# [CATO Symbol Extract: {symbol_name} em {file_path} (L{s_line}-L{e_line})]\n"
-            out_text = header + snippet
-            opt_tok = estimate_tokens(out_text)
-
-            db_instance.record_telemetry(
-                session_id="mcp",
-                event_type="mcp_read_symbol",
-                tool_name="cato_read_symbol",
-                target=f"{Path(file_path).name}#{symbol_name}",
-                raw_tokens=raw_tok,
-                optimized_tokens=opt_tok,
-            )
-            return {"content": [{"type": "text", "text": out_text}], "isError": False}
+            return {"content": [{"type": "text", "text": header + snippet}], "isError": False}
 
         if name == "cato_search_sandbox":
             target_id = str(arguments["id"]).lstrip("#")
             query = str(arguments["query"])
+            if not SANDBOX_ID_RE.match(target_id):
+                return {
+                    "content": [{"type": "text", "text": f"ID inválido: {target_id} (esperado sbx_xxxxxxxx ou cmd_xxxxxxxx)."}],
+                    "isError": True,
+                }
 
             if target_id.startswith("sbx_"):
                 matches = db_instance.search_sandbox(target_id, query, limit=5)
@@ -211,14 +238,16 @@ def handle_mcp_jsonrpc_message(
         return None
 
     if method == "initialize":
-        client_proto = params.get("protocolVersion", "2024-11-05")
+        # Responde com a versão do cliente só se a suportamos; senão, com a mais recente que suportamos
+        client_proto = params.get("protocolVersion")
+        proto = client_proto if client_proto in SUPPORTED_PROTOCOL_VERSIONS else SUPPORTED_PROTOCOL_VERSIONS[0]
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
-                "protocolVersion": client_proto,
+                "protocolVersion": proto,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "cato-mcp", "version": "0.1.0"},
+                "serverInfo": {"name": "cato-mcp", "version": __version__},
             },
         }
 

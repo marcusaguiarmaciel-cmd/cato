@@ -6,7 +6,9 @@ e Extração Cirúrgica de Símbolos (Parte 4 do CATO).
 from __future__ import annotations
 
 import ast
+import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -16,6 +18,12 @@ from cato.code_intel.ast_skeleton import (
     is_code_file,
 )
 from cato.storage.db import estimate_tokens
+
+PY_DECLARATION_RE = re.compile(r"^\s*(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)")
+# Método de classe TS/JS sem modificador (`  getUser(id) {`); exclui `if (...) {`, `for (...) {` etc.
+JS_METHOD_RE = re.compile(
+    r"^\s+(?:async\s+)?(?!(?:if|for|while|switch|catch|function|return)\b)([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*(?::[^{]+)?\{"
+)
 
 IGNORED_DIRS = {
     ".git",
@@ -53,39 +61,38 @@ def extract_symbol_source(file_path: str | Path, symbol_query: str) -> Tuple[str
     target_name = parts[-1] if parts else symbol_query.strip()
     parent_name = parts[0] if len(parts) > 1 else None
 
-    # 1. Extração via AST exata para arquivos Python
+    def numbered(start: int, end: int) -> str:
+        return "\n".join(f"{idx}: {lines[idx - 1]}" for idx in range(start, end + 1))
+
+    # 1. Extração via AST exata para arquivos Python (inclui métodos e funções aninhadas)
     if path.suffix.lower() == ".py":
         try:
-            tree = ast.parse(source, filename=str(path))
-            for node in tree.body:
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    if node.name == target_name and parent_name is None:
+            tree: Optional[ast.AST] = ast.parse(source, filename=str(path))
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            if parent_name:
+                scopes = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == parent_name]
+            else:
+                scopes = [tree]
+            for scope in scopes:
+                for node in ast.walk(scope):
+                    if (
+                        node is not scope
+                        and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                        and node.name == target_name
+                    ):
                         s = getattr(node, "lineno", 1)
                         e = getattr(node, "end_lineno", s)
-                        # Inclui decoradores acima
-                        if getattr(node, "decorator_list", None):
+                        if node.decorator_list:  # inclui decoradores acima
                             s = min(s, *(getattr(d, "lineno", s) for d in node.decorator_list))
-                        snippet = "\n".join(f"{idx}: {lines[idx - 1]}" for idx in range(s, e + 1))
-                        return snippet, s, e
+                        return numbered(s, e), s, e
 
-                    if isinstance(node, ast.ClassDef) and (parent_name is None or node.name == parent_name):
-                        for child in node.body:
-                            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == target_name:
-                                s = getattr(child, "lineno", 1)
-                                e = getattr(child, "end_lineno", s)
-                                if getattr(child, "decorator_list", None):
-                                    s = min(s, *(getattr(d, "lineno", s) for d in child.decorator_list))
-                                snippet = "\n".join(f"{idx}: {lines[idx - 1]}" for idx in range(s, e + 1))
-                                return snippet, s, e
-        except SyntaxError:
-            pass
-
-    # 2. Extração estrutural por balanceamento de chaves/indentação para TS/JS/Rust/Go/Java/Python-fallback
-    pattern = re.compile(rf"\b{re.escape(target_name)}\b")
+    # 2. Extração estrutural para TS/JS/Rust/Go/Java (e Python com erro de sintaxe): só linhas que
+    #    DECLARAM o símbolo; uma linha que apenas o usa (`const x = alvo()`) nunca é tomada como definição
+    patterns = list(DECLARATION_PATTERNS) + [PY_DECLARATION_RE, JS_METHOD_RE]
     for idx, line in enumerate(lines):
-        if pattern.search(line) and any(
-            kw in line for kw in ("def ", "class ", "function ", "interface ", "type ", "struct ", "enum ", "fn ", "func ", "public ", "private ", "async ", "const ")
-        ):
+        if any((m := pat.match(line)) and m.group(1) == target_name for pat in patterns):
             start_line = idx + 1
             brace_balance = line.count("{") - line.count("}")
             end_idx = idx
@@ -98,8 +105,7 @@ def extract_symbol_source(file_path: str | Path, symbol_query: str) -> Tuple[str
             else:
                 end_idx = min(total_lines - 1, idx + 45)
             end_line = end_idx + 1
-            snippet = "\n".join(f"{ln_no}: {lines[ln_no - 1]}" for ln_no in range(start_line, end_line + 1))
-            return snippet, start_line, end_line
+            return numbered(start_line, end_line), start_line, end_line
 
     raise ValueError(f"Símbolo '{symbol_query}' não encontrado em {file_path}")
 
@@ -173,6 +179,43 @@ def _personalized_pagerank(
     return ranks
 
 
+def _collect_code_files(root: Path, limit: int) -> List[Path]:
+    """
+    Arquivos de código do projeto. Num repositório git usa `git ls-files` (respeita o `.gitignore`);
+    fora dele percorre a árvore podando `IGNORED_DIRS` antes de entrar neles (o `rglob` descia em
+    `node_modules` inteiro só para descartar depois).
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            files = [
+                root / rel
+                for rel in sorted(proc.stdout.splitlines())
+                if rel and not any(part in IGNORED_DIRS for part in Path(rel).parts) and is_code_file(rel)
+            ]
+            return [p for p in files if p.is_file()][:limit]
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    found: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIRS)
+        for name in sorted(filenames):
+            if is_code_file(name):
+                found.append(Path(dirpath) / name)
+                if len(found) >= limit:
+                    return found
+    return found
+
+
 def build_repository_map(
     root_dir: str | Path,
     focus_query: Optional[str] = None,
@@ -184,15 +227,7 @@ def build_repository_map(
     empacotando os esqueletos dos arquivos mais importantes dentro do `token_budget`.
     """
     root = Path(root_dir).resolve()
-    code_files: List[Path] = []
-
-    for p in root.rglob("*"):
-        if any(part in IGNORED_DIRS for part in p.parts):
-            continue
-        if p.is_file() and is_code_file(p):
-            code_files.append(p)
-            if len(code_files) >= max_files_scanned:
-                break
+    code_files = _collect_code_files(root, max_files_scanned)
 
     if not code_files:
         return f"# [CATO RepoMap] Nenhum arquivo de código encontrado em {root}"

@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python: 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-success.svg)](pyproject.toml)
-[![Tests Passing](https://img.shields.io/badge/tests-16%2F16%20passing-brightgreen.svg)](tests/test_cato.py)
+[![Tests Passing](https://img.shields.io/badge/tests-17%2F17%20passing-brightgreen.svg)](tests/test_cato.py)
 
 > **[🇺🇸 English version available here](README.md)**
 
@@ -46,8 +46,8 @@ Conclusões que guiam o CATO:
 | Camada | Arquivo | O que faz |
 | :--- | :--- | :--- |
 | **Relatório real** | `telemetry/usage_report.py`, `telemetry/pricing.py` | Custo por categoria, por faixa de contexto, cache misses por causa (pausa > TTL, troca de modelo, compactação), tokens por ferramenta (imagens pela dimensão real), comandos de shell mais verbosos e atribuição por dia de RTK/CATO. Dedup por `message.id` e `tool_use_id`. |
-| **Guard de custo** | `hooks/user_prompt_submit.py` | Antes do prompt ir para a API: se o cache expirou com contexto grande, ou o contexto cruzou 250k/400k/600k, segura o prompt **uma vez** mostrando o custo concreto e as opções (`/clear`, `/compact`). Reenviar segue normal. `/comandos` nunca são bloqueados. |
-| **Bash: RTK + CATO** | `hooks/pre_tool_use.py`, `hooks/post_tool_use.py` | O RTK reescreve comandos (se o hook global dele não estiver instalado, o CATO delega a ele — só para comandos que suas regras de permissão já aprovam). O CATO comprime a **saída real** em `PostToolUse` (`updatedToolOutput`) só do que o RTK não tratou: nunca erros, leitura de código (`sed`, `cat`, `grep`…) nem saídas acima do limite nativo de 30k caracteres. Log bruto em `~/.cato/logs/`. |
+| **Guard de custo** | `hooks/user_prompt_submit.py` | Antes do prompt ir para a API. Cache expirado com contexto grande: se reescrevê-lo custa pelo menos `CATO_GUARD_BLOCK_USD` ($1,00), segura o prompt **uma vez** com o custo e as opções (`/clear`, `/compact`); reenviar segue. Contexto acima de 250k/400k/600k: só um aviso, o prompt segue. Logo após `/compact` espera a próxima chamada real. `/comandos` nunca são tocados. |
+| **Bash: RTK + CATO** | `hooks/pre_tool_use.py`, `hooks/post_tool_use.py` | O RTK reescreve comandos (se o hook global dele não estiver instalado, o CATO delega a ele — só para comandos que suas regras de permissão já aprovam). O CATO comprime a **saída real** em `PostToolUse` (`updatedToolOutput`) só de testes, linters, instalações, builds e logs de container, registrados com filtros `if` dos hooks: para qualquer outro comando o Python nem inicia. Qualquer outra saída é dado e nunca é alterada; só linhas exatamente repetidas colapsam. Log bruto em `~/.cato/logs/`. |
 | **Verificação de sintaxe** | `hooks/post_tool_use.py` | Após `Edit`/`Write` em `.py`/`.json`, avisa o erro de sintaxe no mesmo turno. |
 | **Sandbox de MCP** | `hooks/post_tool_use.py`, `storage/db.py` | Respostas MCP de texto > 1.500 tokens vão para SQLite FTS5 (busca BM25 via `cato_search_sandbox`). |
 | **Pós-compactação** | `hooks/session_lifecycle.py` | Salva o estado do Git antes do `/compact` e o reinjeta depois. |
@@ -88,8 +88,10 @@ cato doctor
 | :--- | :--- | :--- |
 | `CATO_GUARD` | ligado | `0` desliga o guard de custo. |
 | `CATO_CONTEXT_WARN` | `250000,400000,600000` | Faixas de contexto que disparam o aviso. |
-| `CATO_BASH_COMPRESS` | ligado | `0` desliga a compressão de saída de Bash/PowerShell. |
-| `CATO_READ_GUARD` | desligado | `1` liga o esqueleto AST/dedup de `Read`. |
+| `CATO_GUARD_BLOCK_USD` | `1.00` | Custo mínimo de reescrita (USD) para o guard segurar um prompt. |
+| `CATO_GUARD_BLOCK` | ligado | `0` faz o guard só avisar, nunca segurar prompt. |
+| `CATO_BASH_COMPRESS` | ligado | `0` desliga a compressão de saída de Bash. |
+| `CATO_READ_GUARD` | desligado | `1` liga o esqueleto AST/dedup de `Read` (instale com `cato init --read-guard`). |
 | `~/.cato/pricing.json` | tabela oficial | Sobrescreve preços por modelo. |
 
 ---
@@ -107,7 +109,7 @@ system prompt ou a lista de ferramentas — então o prefixo em cache continua v
 python -m unittest discover -s tests -v
 ```
 
-Os **16 testes** usam transcripts sintéticos e um `CATO_HOME` temporário; não tocam em `~/.cato` nem
+Os **17 testes** usam transcripts sintéticos e um `CATO_HOME` temporário; não tocam em `~/.cato` nem
 nos seus transcripts.
 
 ---

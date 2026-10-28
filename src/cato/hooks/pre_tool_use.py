@@ -17,21 +17,27 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from cato.code_intel.dedup import DEFAULT_SKELETON_LINE_THRESHOLD, evaluate_read_request
 from cato.hooks.bash_permissions import is_preapproved_bash_command, rtk_hook_installed
-from cato.storage.db import CatoDB
+
+if TYPE_CHECKING:
+    from cato.storage.db import CatoDB
 
 
-def get_cato_executable_cmd() -> str:
-    """Retorna o comando para invocar a CLI do CATO de forma confiável em Bash, PowerShell e CMD."""
+def get_cato_executable_cmd(script: str = "cli.py") -> str:
+    """
+    Comando para invocar um script do CATO de forma confiável em Bash, PowerShell e CMD.
+    Hooks usam `hook_runner.py` (import mínimo); comandos manuais usam `cli.py`.
+    `-S` pula o `site` (o CATO não tem dependências) e corta parte do tempo de partida do Python.
+    """
     src_dir = Path(__file__).resolve().parents[2]
     py_exe = str(Path(sys.executable).resolve()).replace("\\", "/")
-    cli_script = str((src_dir / "cato" / "cli.py").resolve()).replace("\\", "/")
+    target = str((src_dir / "cato" / script).resolve()).replace("\\", "/")
     py_quoted = f'"{py_exe}"' if " " in py_exe else py_exe
-    cli_quoted = f'"{cli_script}"' if " " in cli_script else cli_script
-    return f"{py_quoted} {cli_quoted}"
+    target_quoted = f'"{target}"' if " " in target else target
+    flags = " -S" if script == "hook_runner.py" else ""
+    return f"{py_quoted}{flags} {target_quoted}"
 
 
 def try_delegate_to_rtk(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -78,7 +84,7 @@ def try_delegate_to_rtk(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def handle_pre_tool_use(
     payload: Dict[str, Any],
-    db: Optional[CatoDB] = None,
+    db: Optional["CatoDB"] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Processa o payload JSON do evento `PreToolUse` do Claude Code e retorna
@@ -97,6 +103,9 @@ def handle_pre_tool_use(
         file_path = tool_input.get("file_path") or tool_input.get("path")
         if not file_path:
             return None
+        # Imports tardios: só quem liga o Read guard paga o custo de carregar AST/SQLite
+        from cato.code_intel.dedup import DEFAULT_SKELETON_LINE_THRESHOLD, evaluate_read_request
+        from cato.storage.db import CatoDB
 
         offset = tool_input.get("offset")
         limit = tool_input.get("limit")

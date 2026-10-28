@@ -62,7 +62,9 @@ def _configure_utf8_stdio() -> None:
 
 def cmd_init(args: argparse.Namespace) -> int:
     target = Path.home() / ".claude" if args.global_scope else Path(args.dir).resolve()
-    result = install_cato(target_root=target, is_global=args.global_scope, dry_run=args.dry_run)
+    result = install_cato(
+        target_root=target, is_global=args.global_scope, dry_run=args.dry_run, read_guard=args.read_guard
+    )
 
     scope_label = "GLOBAL (~/.claude)" if args.global_scope else f"PROJETO ({target})"
     print(f"=== CATO Inicializado [{scope_label}] ===")
@@ -263,6 +265,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--global", dest="global_scope", action="store_true", help="Instalar em ~/.claude global")
     p_init.add_argument("--dir", default=".", help="Diretório raiz do projeto (padrão: .)")
     p_init.add_argument("--dry-run", action="store_true", help="Apenas simular sem gravar arquivos")
+    p_init.add_argument(
+        "--read-guard",
+        action="store_true",
+        help="Registra também o Read guard (esqueleto AST/dedup); use junto com CATO_READ_GUARD=1",
+    )
 
     # cato doctor
     p_doc = sub.add_parser("doctor", help="Audita a configuração do Claude Code em busca de desperdício de tokens")

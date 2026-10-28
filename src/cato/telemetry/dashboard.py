@@ -31,6 +31,7 @@ from cato.telemetry.usage_report import (
 
 REPORT_CACHE_FILE = "report_cache.json"
 DEFAULT_REPORT_DAYS = 30
+STATUSLINE_MAX_REPORT_AGE_MIN = 180
 
 _RTK_MEMO: Optional[Dict[str, Any]] = None
 _RTK_TS: float = 0.0
@@ -116,18 +117,23 @@ def collect_real_metrics(
     except Exception:
         cached = None
     if cached and cached.get("key") == key:
+        payload = dict(cached["payload"])
+        payload["cache_created"] = float(cached.get("created", 0))
         if cached_only:
-            return cached["payload"]
-        fresh = time.time() - float(cached.get("created", 0)) < max_age
+            return payload
+        fresh = time.time() - payload["cache_created"] < max_age
         if fresh or cached.get("fingerprint") == _transcripts_fingerprint(project):
-            return cached["payload"]
+            return payload
     if cached_only:
-        return cached["payload"] if cached else None
+        # Nunca devolve o relatório de outra janela/projeto: sem cache certo, nada
+        return None
 
     fingerprint = _transcripts_fingerprint(project)
     report = build_report(days=days, project=project)
     rtk = query_rtk_savings()
-    cato_stats = (db or CatoDB()).get_summary_stats()
+    db_instance = db or CatoDB()
+    db_instance.prune()  # fora dos hooks: aproveita a varredura completa para limpar dados de trabalho antigos
+    cato_stats = db_instance.get_summary_stats()
     rtk_days = [d for d, v in rtk.get("daily", {}).items() if v.get("commands")]
     cato_days = [r["date"] for r in cato_stats.get("by_day", []) if r.get("count")]
     report["attributions"] = {}
@@ -140,6 +146,7 @@ def collect_real_metrics(
         "report": report,
         "rtk": rtk,
         "cato": cato_stats,
+        "cache_created": time.time(),
     }
     try:
         cache_path.write_text(
@@ -171,7 +178,9 @@ def format_statusline_text(db: Optional[CatoDB] = None, status_input: Optional[D
     parts: List[str] = ["⚡ CATO"]
     transcript = (status_input or {}).get("transcript_path")
     state = last_turn_state(transcript) if transcript else None
-    if state:
+    if state and state.get("compacted"):
+        parts.append("ctx: compactado (mede de novo na próxima resposta)")
+    elif state:
         price = price_for(state["model"])
         ctx = state["context"]
         parts.append(f"ctx {ctx / 1000:.0f}k")
@@ -183,14 +192,16 @@ def format_statusline_text(db: Optional[CatoDB] = None, status_input: Optional[D
         else:
             parts.append(f"próximo turno ≈ ${ctx * price.read / 1e6:.3f}")
             parts.append(f"cache expira em {int((ttl - idle) // 60)}min")
+    # O total do dia vem do último `cato stats`/`dashboard` (varrer os transcripts a cada 2 s seria caro):
+    # mostra a idade do número e some quando ficou velho demais para orientar decisão
     payload = collect_real_metrics(db, cached_only=True)
-    if payload:
+    age_min = (time.time() - float(payload.get("cache_created", 0))) / 60 if payload else None
+    if payload and age_min is not None and age_min <= STATUSLINE_MAX_REPORT_AGE_MIN:
         report = payload["report"]
         today = report.get("daily", {}).get(datetime.date.today().isoformat(), {})
-        parts.append(f"hoje ${today.get('cost', 0.0):.2f}")
-        parts.append(f"{DEFAULT_REPORT_DAYS}d ${report.get('total_cost', 0.0):,.0f}")
+        parts.append(f"hoje ${today.get('cost', 0.0):.2f} (há {int(age_min)}min)")
     elif not state:
-        parts.append("rode `cato stats` para gerar o relatório")
+        parts.append("rode `cato stats` para atualizar o custo do dia")
     return " | ".join(parts)
 
 
