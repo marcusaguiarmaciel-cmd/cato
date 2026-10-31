@@ -5,7 +5,7 @@
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-success.svg)](pyproject.toml)
 [![Tests Passing](https://img.shields.io/badge/tests-17%2F17%20passing-brightgreen.svg)](tests/test_cato.py)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
-[![M8ven Score](https://m8ven.ai/badge/mcp/marcusaguiarmaciel-cmd-cato-pu8wpa?v=2bd2c6822fbb7950d053a873471b0ca1)](https://m8ven.ai/mcp/marcusaguiarmaciel-cmd-cato-pu8wpa?s=readme)
+[![M8ven Score](https://m8ven.ai/badge/mcp/marcusaguiarmaciel-cmd/cato)](https://m8ven.ai/mcp/marcusaguiarmaciel-cmd/cato?s=readme)
 
 > **[🇧🇷 Versão em Português disponível aqui](README.pt-BR.md)**
 
