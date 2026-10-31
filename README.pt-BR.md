@@ -1,9 +1,13 @@
 # ⚡ CATO (`Claude Adaptive Token Optimizer`)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![M8ven Score](https://m8ven.ai/badge/mcp/marcusaguiarmaciel-cmd-cato-pu8wpa)](https://m8ven.ai/mcp/marcusaguiarmaciel-cmd-cato-pu8wpa?s=readme)
+[![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/marcusaguiarmaciel-cmd/badge.svg)](https://hub.xerj.org/contributors/marcusaguiarmaciel-cmd)
+[![Tests Passing](https://img.shields.io/badge/tests-17%2F17%20passing-brightgreen.svg)](tests/test_cato.py)
 [![Python: 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-success.svg)](pyproject.toml)
-[![Tests Passing](https://img.shields.io/badge/tests-17%2F17%20passing-brightgreen.svg)](tests/test_cato.py)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Apoiar o CATO](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/marcusaguiarmaciel-cmd)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 > **[🇺🇸 English version available here](README.md)**
 
