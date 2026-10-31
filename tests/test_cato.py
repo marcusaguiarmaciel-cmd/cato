@@ -526,6 +526,10 @@ class TestCatoSystem(unittest.TestCase):
         self.assertIn("cato_read_symbol", tool_names)
         self.assertIn("cato_search_sandbox", tool_names)
         self.assertIn("cato_token_savings", tool_names)
+        for tool in list_resp["result"]["tools"]:
+            annotations = tool.get("annotations", {})
+            for hint in ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"):
+                self.assertIsInstance(annotations.get(hint), bool, f"{tool['name']} sem {hint}")
 
         init = handle_mcp_jsonrpc_message({"id": 2, "method": "initialize", "params": {"protocolVersion": "1999-01-01"}})
         self.assertEqual(init["result"]["protocolVersion"], "2025-06-18")  # não ecoa versão desconhecida

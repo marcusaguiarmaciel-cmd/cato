@@ -62,9 +62,19 @@ def check_readable_path(file_path: str) -> Path:
                 raise PermissionError(f"{rel} é bloqueado pela regra {rule} em {settings_path}")
     return path
 
+# Todas as ferramentas só leem arquivos locais/SQLite do CATO: nenhuma altera o projeto
+# do usuário nem acessa a rede. O único efeito colateral é cache interno do CATO.
+READ_ONLY_LOCAL_ANNOTATIONS: Dict[str, bool] = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+}
+
 MCP_TOOLS_SCHEMA: List[Dict[str, Any]] = [
     {
         "name": "cato_repo_map",
+        "annotations": {"title": "Repository Map", **READ_ONLY_LOCAL_ANNOTATIONS},
         "description": (
             "Generate a compact AST repository map ranked by Personalized PageRank over the symbol dependency graph. "
             "Use this instead of running multiple Glob/Grep/Read loops when exploring a codebase."
@@ -89,6 +99,7 @@ MCP_TOOLS_SCHEMA: List[Dict[str, Any]] = [
     },
     {
         "name": "cato_read_symbol",
+        "annotations": {"title": "Read Symbol", **READ_ONLY_LOCAL_ANNOTATIONS},
         "description": (
             "Read ONLY the exact AST source code lines of a specific class, function, or method (e.g. 'MyClass.my_method' "
             "or 'my_function') with line numbers, saving 75-95% of tokens compared to reading the entire file."
@@ -110,6 +121,7 @@ MCP_TOOLS_SCHEMA: List[Dict[str, Any]] = [
     },
     {
         "name": "cato_search_sandbox",
+        "annotations": {"title": "Search Sandbox", **READ_ONLY_LOCAL_ANNOTATIONS},
         "description": (
             "Query a virtualized MCP payload (sbx_xxxx) using SQLite FTS5 BM25 search, or grep inside a "
             "saved raw command log (cmd_xxxx) without loading the entire output into context."
@@ -131,6 +143,7 @@ MCP_TOOLS_SCHEMA: List[Dict[str, Any]] = [
     },
     {
         "name": "cato_token_savings",
+        "annotations": {"title": "Token Savings Report", **READ_ONLY_LOCAL_ANNOTATIONS},
         "description": "Get the real API-equivalent cost of recent Claude Code sessions (billed usage x official prices), cache misses and context-size breakdown.",
         "inputSchema": {
             "type": "object",
